@@ -1,0 +1,1058 @@
+"""Unit tests for Linear OAuth CLI modules."""
+
+from __future__ import annotations
+
+import socket
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack
+from urllib.parse import parse_qs
+
+import httpx
+import threading
+import time
+import urllib.error
+import urllib.request
+import pytest
+from potpie.cli.commands._common import set_store
+from tests._auth_fakes import InMemoryCredentialStore
+from potpie.auth.adapters.callback_server import (
+    OAuthCallbackResult,
+    _first,
+    _oauth_callback_failure_html,
+    start_oauth_callback_server,
+    wait_for_oauth_callback,
+)
+import base64
+import hashlib
+from potpie.auth.adapters.pkce import generate_pkce_pair
+from unittest.mock import MagicMock, patch
+from potpie.auth.adapters import token_exchange as tx
+from potpie.auth.adapters.http import AuthHttpClient
+from potpie.auth.adapters import (
+    integration_session as session,
+)
+import typer
+from potpie.cli.auth import auth_commands
+from potpie.auth.adapters.provider_config import (
+    DEFAULT_CALLBACK_PORT,
+    DEFAULT_FALLBACK_CALLBACK_PORTS,
+)
+import json
+# --- test_callback_server.py ---
+
+
+def test_oauth_callback_failure_html_escapes_error() -> None:
+    body = _oauth_callback_failure_html('<script>alert("xss")</script>')
+    assert "<script>" not in body
+    assert "&lt;script&gt;" in body
+    assert "alert(&quot;xss&quot;)" in body
+
+
+def test_oauth_callback_failure_html_default_message() -> None:
+    body = _oauth_callback_failure_html(None)
+    assert "No authorization code received" in body
+
+
+def test_oauth_callback_result_ok() -> None:
+    ok = OAuthCallbackResult(code="abc", state="s1")
+    assert ok.ok is True
+    bad = OAuthCallbackResult(error="access_denied")
+    assert bad.ok is False
+
+
+def test_first_param_helper() -> None:
+    assert _first({"code": ["abc"]}, "code") == "abc"
+    assert _first({}, "code") is None
+    assert _first({"code": [""]}, "code") is None
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _run_oauth_callback_test(
+    *,
+    port: int,
+    hit_url: str,
+    path: str = "/callback",
+    timeout: float = 5.0,
+    on_hit: callable | None = None,
+) -> OAuthCallbackResult:
+    """Start the callback server first, then hit it (avoids CI race)."""
+    result_box: dict[str, OAuthCallbackResult] = {}
+
+    def serve() -> None:
+        result_box["result"] = wait_for_oauth_callback(
+            host="127.0.0.1", port=port, path=path, timeout=timeout
+        )
+
+    server_thread = threading.Thread(target=serve, daemon=True)
+    server_thread.start()
+    time.sleep(0.15)
+    if on_hit is not None:
+        on_hit(hit_url)
+    else:
+        with urllib.request.urlopen(hit_url, timeout=timeout) as resp:
+            assert resp.status == 200
+    server_thread.join(timeout=timeout + 1.0)
+    return result_box["result"]
+
+
+def test_wait_for_oauth_callback_success() -> None:
+    port = _free_port()
+    hit_url = f"http://127.0.0.1:{port}/callback?code=auth-code&state=xyz"
+    result = _run_oauth_callback_test(port=port, hit_url=hit_url)
+
+    assert result.ok is True
+    assert result.code == "auth-code"
+    assert result.state == "xyz"
+
+
+def test_wait_for_oauth_callback_error_query() -> None:
+    port = _free_port()
+    hit_url = f"http://127.0.0.1:{port}/callback?error=access_denied"
+    result = _run_oauth_callback_test(port=port, hit_url=hit_url)
+
+    assert result.ok is False
+    assert result.error == "access_denied"
+
+
+def test_start_oauth_callback_server_uses_fallback_port() -> None:
+    primary = _free_port()
+    fallback = _free_port()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+        occupied.bind(("127.0.0.1", primary))
+        occupied.listen(1)
+        server = start_oauth_callback_server(
+            host="127.0.0.1",
+            port=primary,
+            path="/callback",
+            fallback_ports=(fallback,),
+        )
+    try:
+        assert server.port == fallback
+    finally:
+        server.close()
+
+
+def test_wait_for_oauth_callback_wrong_path_returns_404() -> None:
+    port = _free_port()
+    hit_url = f"http://127.0.0.1:{port}/callback?code=ignored"
+
+    def on_hit(url: str) -> None:
+        try:
+            urllib.request.urlopen(url, timeout=5)
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
+
+    result_box: dict[str, OAuthCallbackResult | BaseException] = {}
+
+    def serve() -> None:
+        try:
+            result_box["result"] = wait_for_oauth_callback(
+                host="127.0.0.1",
+                port=port,
+                path="/other",
+                timeout=0.5,
+            )
+        except BaseException as exc:
+            result_box["result"] = exc
+
+    server_thread = threading.Thread(target=serve, daemon=True)
+    server_thread.start()
+    time.sleep(0.15)
+    on_hit(hit_url)
+    server_thread.join(timeout=2.0)
+
+    assert isinstance(result_box["result"], TimeoutError)
+
+
+# --- test_pkce.py ---
+
+
+def test_generate_pkce_pair_returns_s256_challenge() -> None:
+    verifier, challenge = generate_pkce_pair()
+    assert len(verifier) == 64
+    expected = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    assert challenge == expected
+
+
+def test_generate_pkce_pair_produces_unique_values() -> None:
+    first = generate_pkce_pair()
+    second = generate_pkce_pair()
+    assert first != second
+
+
+# --- test_token_exchange.py ---
+
+
+@pytest.fixture(autouse=True)
+def _linear_client_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep token requests deterministic with a configured Linear client ID."""
+    monkeypatch.setenv("LINEAR_CLIENT_ID", "test-linear-client-id")
+
+
+OAuthHttpClientFactory = Callable[
+    [dict[str, str], httpx.Response], tuple[AuthHttpClient, list[httpx.Request]]
+]
+
+
+@pytest.fixture()
+def oauth_http_client() -> Iterator[OAuthHttpClientFactory]:
+    """Record real HTTPX requests and reject anything outside the token contract."""
+    with ExitStack() as stack:
+
+        def make_client(
+            expected_form: dict[str, str], response: httpx.Response
+        ) -> tuple[AuthHttpClient, list[httpx.Request]]:
+            """Create a managed client that accepts one expected token request."""
+            requests: list[httpx.Request] = []
+
+            def handle(request: httpx.Request) -> httpx.Response:
+                """Validate the token endpoint and complete form before returning a response."""
+                requests.append(request)
+                assert len(requests) == 1, "Unexpected additional OAuth request"
+                assert request.method == "POST", "Unexpected OAuth request method"
+                assert str(request.url) == "https://api.linear.app/oauth/token"
+                assert (
+                    request.headers.get("content-type")
+                    == "application/x-www-form-urlencoded"
+                ), "OAuth token requests must use form encoding"
+                assert parse_qs(
+                    request.content.decode(),
+                    keep_blank_values=True,
+                    strict_parsing=True,
+                ) == {key: [value] for key, value in expected_form.items()}
+                return response
+
+            client = stack.enter_context(
+                httpx.Client(transport=httpx.MockTransport(handle))
+            )
+            return AuthHttpClient(client=client), requests
+
+        yield make_client
+
+
+@pytest.mark.parametrize("use_explicit_redirect", [True, False])
+def test_exchange_authorization_code_success(
+    oauth_http_client: OAuthHttpClientFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    use_explicit_redirect: bool,
+) -> None:
+    """Send the PKCE code and selected redirect URI in one form-encoded request."""
+    configured_redirect = "http://localhost:28757/callback?source=cli&mode=oauth"
+    explicit_redirect = "http://localhost:8080/callback?source=cli&mode=oauth"
+    monkeypatch.setenv("POTPIE_CLI_OAUTH_REDIRECT_URI", configured_redirect)
+    redirect_uri = explicit_redirect if use_explicit_redirect else None
+    client, requests = oauth_http_client(
+        {
+            "grant_type": "authorization_code",
+            "client_id": "test-linear-client-id",
+            "code": "auth-code+with spaces&symbols=",
+            "code_verifier": "pkce-verifier_123",
+            "redirect_uri": explicit_redirect
+            if use_explicit_redirect
+            else configured_redirect,
+        },
+        httpx.Response(
+            200,
+            json={
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "token_type": "Bearer",
+                "scope": "read",
+                "expires_in": 3600,
+            },
+        ),
+    )
+
+    tokens = tx.exchange_authorization_code(
+        "linear",
+        code="auth-code+with spaces&symbols=",
+        code_verifier="pkce-verifier_123",
+        redirect_uri=redirect_uri,
+        http=client,
+    )
+
+    assert len(requests) == 1
+    assert tokens["access_token"] == "access"
+    assert tokens["refresh_token"] == "refresh"
+    assert tokens["expires_at"] is not None
+
+
+def test_exchange_authorization_code_rejects_non_linear() -> None:
+    with pytest.raises(ValueError, match="only supported for Linear"):
+        tx.exchange_authorization_code(
+            "github",  # type: ignore[arg-type]
+            code="c",
+            code_verifier="v",
+        )
+
+
+def test_exchange_authorization_code_requires_verifier() -> None:
+    """Reject code exchanges without the required PKCE verifier."""
+    with pytest.raises(ValueError, match="code_verifier is required"):
+        tx.exchange_authorization_code("linear", code="c", code_verifier="")
+
+
+def test_exchange_authorization_code_http_error(
+    oauth_http_client: OAuthHttpClientFactory,
+) -> None:
+    """Surface a rejected code exchange after validating its outbound form."""
+    client, requests = oauth_http_client(
+        {
+            "grant_type": "authorization_code",
+            "client_id": "test-linear-client-id",
+            "code": "rejected-code",
+            "code_verifier": "verifier",
+            "redirect_uri": "http://localhost:8080/callback",
+        },
+        httpx.Response(400, text="bad request"),
+    )
+
+    with pytest.raises(RuntimeError, match="Token exchange failed"):
+        tx.exchange_authorization_code(
+            "linear",
+            code="rejected-code",
+            code_verifier="verifier",
+            redirect_uri="http://localhost:8080/callback",
+            http=client,
+        )
+    assert len(requests) == 1
+
+
+def test_refresh_access_token_success(
+    oauth_http_client: OAuthHttpClientFactory,
+) -> None:
+    """Form-encode the trimmed refresh token and retain it in the result."""
+    client, requests = oauth_http_client(
+        {
+            "grant_type": "refresh_token",
+            "client_id": "test-linear-client-id",
+            "refresh_token": "refresh+token&value=",
+        },
+        httpx.Response(
+            200,
+            json={
+                "access_token": "new-access",
+                "token_type": "Bearer",
+                "expires_in": 1800,
+            },
+        ),
+    )
+
+    tokens = tx.refresh_access_token(
+        "linear", refresh_token="  refresh+token&value=  ", http=client
+    )
+
+    assert len(requests) == 1
+    assert tokens["access_token"] == "new-access"
+    assert tokens["refresh_token"] == "refresh+token&value="
+
+
+def test_refresh_access_token_requires_token() -> None:
+    """Reject refresh requests whose token is empty after trimming."""
+    with pytest.raises(ValueError, match="refresh_token is required"):
+        tx.refresh_access_token("linear", refresh_token="  ")
+
+
+def test_exchange_missing_client_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tx, "get_client_id", lambda _p: "")
+    with pytest.raises(ValueError, match="LINEAR_CLIENT_ID"):
+        tx.exchange_authorization_code("linear", code="c", code_verifier="v")
+
+
+def test_refresh_missing_client_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tx, "get_client_id", lambda _p: "")
+    with pytest.raises(ValueError, match="LINEAR_CLIENT_ID"):
+        tx.refresh_access_token("linear", refresh_token="rt")
+
+
+def test_refresh_rejects_non_linear() -> None:
+    """Reject refresh requests for providers without Linear refresh support."""
+    with pytest.raises(ValueError, match="only supported for Linear"):
+        tx.refresh_access_token("github", refresh_token="rt")  # type: ignore[arg-type]
+
+
+def test_refresh_http_error(oauth_http_client: OAuthHttpClientFactory) -> None:
+    """Surface an unauthorized refresh after validating its outbound form."""
+    client, requests = oauth_http_client(
+        {
+            "grant_type": "refresh_token",
+            "client_id": "test-linear-client-id",
+            "refresh_token": "rejected-refresh-token",
+        },
+        httpx.Response(401, text="unauthorized"),
+    )
+
+    with pytest.raises(RuntimeError, match="Token refresh failed"):
+        tx.refresh_access_token(
+            "linear", refresh_token="rejected-refresh-token", http=client
+        )
+    assert len(requests) == 1
+
+
+# --- test_integration_session.py ---
+
+
+def test_ensure_valid_linear_expired_without_refresh_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expired = {"access_token": "old", "expires_at": 0.0}
+    monkeypatch.setattr(session, "get_integration_tokens", lambda _p: expired)
+    monkeypatch.setattr(session, "token_needs_refresh", lambda _expires_at: True)
+
+    result = session.ensure_valid_integration_tokens("linear")
+
+    assert result == {}
+
+
+def test_ensure_valid_linear_refreshes_when_refresh_token_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = {
+        "access_token": "old",
+        "refresh_token": "rt",
+        "expires_at": 0.0,
+        "scope": "read",
+    }
+    monkeypatch.setattr(session, "get_integration_tokens", lambda _p: dict(stored))
+    monkeypatch.setattr(session, "token_needs_refresh", lambda _expires_at: True)
+    monkeypatch.setattr(
+        session,
+        "refresh_access_token",
+        lambda _provider, refresh_token: {
+            "access_token": "new",
+            "refresh_token": refresh_token,
+            "expires_at": 9999999999.0,
+        },
+    )
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        session,
+        "save_integration_tokens",
+        lambda _provider, tokens: saved.append(tokens),
+    )
+
+    result = session.ensure_valid_integration_tokens("linear")
+
+    assert result["access_token"] == "new"
+    assert saved and saved[0]["access_token"] == "new"
+
+
+def test_token_needs_refresh_with_buffer() -> None:
+    import time as time_module
+
+    future = time_module.time() + 1000
+    assert session.token_needs_refresh(future, buffer_seconds=300) is False
+    past = time_module.time() - 10
+    assert session.token_needs_refresh(past, buffer_seconds=300) is True
+    assert session.token_needs_refresh(None) is False
+    assert session.token_needs_refresh("not-a-number") is False
+
+
+def test_ensure_valid_linear_empty_access_token_returns_stored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = {"access_token": "  ", "refresh_token": "rt", "expires_at": 0.0}
+    monkeypatch.setattr(session, "get_integration_tokens", lambda _p: dict(stored))
+    monkeypatch.setattr(session, "token_needs_refresh", lambda _expires_at: True)
+
+    result = session.ensure_valid_integration_tokens("linear")
+
+    assert result == stored
+
+
+def test_ensure_valid_linear_refresh_preserves_cloud_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = {
+        "access_token": "old",
+        "refresh_token": "rt",
+        "expires_at": 0.0,
+        "cloud_id": "cid-1",
+        "scope": "read",
+    }
+    monkeypatch.setattr(session, "get_integration_tokens", lambda _p: dict(stored))
+    monkeypatch.setattr(session, "token_needs_refresh", lambda _expires_at: True)
+    monkeypatch.setattr(
+        session,
+        "refresh_access_token",
+        lambda _provider, refresh_token: {
+            "access_token": "new",
+            "refresh_token": refresh_token,
+            "expires_at": 9999999999.0,
+        },
+    )
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        session,
+        "save_integration_tokens",
+        lambda _provider, tokens: saved.append(tokens),
+    )
+
+    result = session.ensure_valid_integration_tokens("linear")
+
+    assert result["cloud_id"] == "cid-1"
+    assert saved and saved[0]["cloud_id"] == "cid-1"
+
+
+def test_ensure_valid_linear_returns_tokens_when_not_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = {"access_token": "ok", "expires_at": 9999999999.0}
+    monkeypatch.setattr(session, "get_integration_tokens", lambda _p: dict(stored))
+    monkeypatch.setattr(session, "token_needs_refresh", lambda _expires_at: False)
+
+    with patch.object(session, "refresh_access_token") as refresh:
+        result = session.ensure_valid_integration_tokens("linear")
+
+    assert result == stored
+    refresh.assert_not_called()
+
+
+# --- test_auth_commands_linear_oauth.py ---
+
+
+class _FakeCallbackServer:
+    def __init__(self) -> None:
+        self.host = "localhost"
+        self.port = DEFAULT_CALLBACK_PORT
+        self.path = "/callback"
+        self.result = OAuthCallbackResult(code="auth-code", state="state-xyz")
+        self.wait_exc: BaseException | None = None
+        self.start_exc: BaseException | None = None
+        self.closed = False
+        self.start_calls: list[dict[str, object]] = []
+
+    def wait(self, *, timeout: float = 300.0) -> OAuthCallbackResult:
+        if self.wait_exc is not None:
+            raise self.wait_exc
+        return self.result
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def callback_server(monkeypatch: pytest.MonkeyPatch) -> _FakeCallbackServer:
+    server = _FakeCallbackServer()
+
+    def _start(**kwargs: object) -> _FakeCallbackServer:
+        server.start_calls.append(kwargs)
+        if server.start_exc is not None:
+            raise server.start_exc
+        return server
+
+    monkeypatch.setattr(auth_commands, "start_oauth_callback_server", _start)
+    return server
+
+
+@pytest.fixture
+def browser(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    browser = MagicMock()
+    browser.open.return_value = True
+    monkeypatch.setattr(auth_commands, "webbrowser", browser)
+    return browser
+
+
+@pytest.fixture
+def credential_store() -> InMemoryCredentialStore:
+    store = InMemoryCredentialStore()
+    set_store(store)
+    return store
+
+
+@pytest.fixture
+def linear_oauth_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(auth_commands, "get_client_id", lambda _p: "client-id")
+    monkeypatch.setattr(auth_commands, "get_callback_host", lambda: "localhost")
+    monkeypatch.setattr(auth_commands, "get_callback_path", lambda: "/callback")
+    monkeypatch.setattr(auth_commands.secrets, "token_urlsafe", lambda _n: "state-xyz")
+    monkeypatch.setattr(auth_commands, "generate_pkce_pair", lambda: ("v", "c"))
+    monkeypatch.setattr(
+        auth_commands,
+        "get_callback_port_candidates",
+        lambda: (DEFAULT_CALLBACK_PORT, *DEFAULT_FALLBACK_CALLBACK_PORTS),
+    )
+    monkeypatch.setattr(
+        auth_commands,
+        "get_redirect_uri_for_port",
+        lambda actual_port: f"http://localhost:{actual_port}/callback",
+    )
+
+
+def test_run_linear_oauth_flow_success(
+    auth_json_cli: None,
+    linear_oauth_config: None,
+    callback_server: _FakeCallbackServer,
+    browser: MagicMock,
+    credential_store: InMemoryCredentialStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_reads = iter(
+        [
+            {"authenticated": False},
+            {
+                "authenticated": True,
+                "login": "Ada",
+                "email": "a@example.com",
+                "auth_type": "oauth",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: next(status_reads),
+    )
+    monkeypatch.setattr(
+        auth_commands, "generate_pkce_pair", lambda: ("verifier", "challenge")
+    )
+    monkeypatch.setattr(
+        auth_commands,
+        "exchange_authorization_code",
+        lambda *_a, **_k: {
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_at": 9999999999.0,
+            "scope": "read",
+        },
+    )
+    store = credential_store
+    printed: list[dict] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "print_json_blob",
+        lambda payload, **kwargs: printed.append(payload),
+    )
+    auth_commands._run_linear_oauth_flow(force=True)
+
+    assert store.get_integration_tokens("linear").get("access_token") == "access"
+    assert printed and printed[-1].get("ok") is True
+    assert callback_server.start_calls == [
+        {
+            "host": "localhost",
+            "port": DEFAULT_CALLBACK_PORT,
+            "path": "/callback",
+            "fallback_ports": DEFAULT_FALLBACK_CALLBACK_PORTS,
+        }
+    ]
+
+
+def test_run_linear_oauth_flow_already_connected(
+    auth_cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: {"authenticated": True, "expires_at": 9999999999.0},
+    )
+    monkeypatch.setattr(auth_commands, "token_needs_refresh", lambda _x: False)
+    monkeypatch.setattr(
+        "potpie.auth.adapters.credentials_store.list_linear_organizations",
+        lambda: [{"id": "org-1", "name": "Potpie AI CLI", "key": "potpie-ai-cli"}],
+    )
+
+    auth_commands._run_linear_oauth_flow()
+
+    out = capsys.readouterr().out
+    assert "already connected" in out.lower()
+    assert "--add" in out
+
+
+def test_run_linear_oauth_flow_missing_client_id(
+    auth_cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: {"authenticated": False},
+    )
+    monkeypatch.setattr(auth_commands, "get_client_id", lambda _p: "")
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "emit_error",
+        lambda title, message, **kwargs: captured.append((title, message)),
+    )
+
+    with pytest.raises(typer.Exit):
+        auth_commands._run_linear_oauth_flow(force=True)
+
+    assert captured
+    assert captured[0][0] == "Linear login unavailable"
+    assert "LINEAR_CLIENT_ID" in captured[0][1]
+
+
+def test_run_linear_oauth_flow_expired_reauth_message(
+    auth_cli: None,
+    linear_oauth_config: None,
+    callback_server: _FakeCallbackServer,
+    browser: MagicMock,
+    credential_store: InMemoryCredentialStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: {"authenticated": True, "expires_at": 0.0},
+    )
+    monkeypatch.setattr(auth_commands, "token_needs_refresh", lambda _x: True)
+    monkeypatch.setattr(auth_commands, "_try_refresh_linear_session", lambda: False)
+    callback_server.result = OAuthCallbackResult(code="c", state="state-xyz")
+    monkeypatch.setattr(
+        auth_commands,
+        "exchange_authorization_code",
+        lambda *_a, **_k: {"access_token": "a", "expires_at": 9999999999.0},
+    )
+    lines: list[str] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "print_plain_line",
+        lambda message, **kwargs: lines.append(message),
+    )
+    status_queue = [
+        {"authenticated": True, "expires_at": 0.0},
+        {"authenticated": True, "login": "Ada", "auth_type": "oauth"},
+    ]
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: (
+            status_queue.pop(0)
+            if status_queue
+            else {"authenticated": True, "login": "Ada", "auth_type": "oauth"}
+        ),
+    )
+
+    auth_commands._run_linear_oauth_flow()
+
+    assert any("expired" in line.lower() for line in lines)
+
+
+def test_run_linear_oauth_flow_state_mismatch(
+    auth_cli: None,
+    linear_oauth_config: None,
+    callback_server: _FakeCallbackServer,
+    browser: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: {"authenticated": False},
+    )
+    monkeypatch.setattr(
+        auth_commands.secrets, "token_urlsafe", lambda _n: "expected-state"
+    )
+    callback_server.result = OAuthCallbackResult(code="c", state="wrong-state")
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "emit_error",
+        lambda title, message, **kwargs: captured.append((title, message)),
+    )
+
+    with pytest.raises(typer.Exit):
+        auth_commands._run_linear_oauth_flow(force=True)
+
+    assert any("State mismatch" in msg for _t, msg in captured)
+
+
+def test_run_linear_oauth_flow_missing_code(
+    auth_cli: None,
+    linear_oauth_config: None,
+    callback_server: _FakeCallbackServer,
+    browser: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: {"authenticated": False},
+    )
+    callback_server.result = OAuthCallbackResult(state="state-xyz")
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "emit_error",
+        lambda title, message, **kwargs: captured.append((title, message)),
+    )
+
+    with pytest.raises(typer.Exit):
+        auth_commands._run_linear_oauth_flow(force=True)
+
+    assert any("No authorization code" in msg for _t, msg in captured)
+
+
+def test_run_linear_oauth_flow_oauth_error(
+    auth_cli: None,
+    linear_oauth_config: None,
+    callback_server: _FakeCallbackServer,
+    browser: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: {"authenticated": False},
+    )
+    callback_server.result = OAuthCallbackResult(
+        error="access_denied", error_description="user denied", state="state-xyz"
+    )
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "emit_error",
+        lambda title, message, **kwargs: captured.append((title, message)),
+    )
+
+    with pytest.raises(typer.Exit):
+        auth_commands._run_linear_oauth_flow(force=True)
+
+    assert captured
+    assert "Linear OAuth failed" in captured[0][0]
+
+
+def test_run_linear_oauth_flow_exchange_failure(
+    auth_cli: None,
+    linear_oauth_config: None,
+    callback_server: _FakeCallbackServer,
+    browser: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: {"authenticated": False},
+    )
+    callback_server.result = OAuthCallbackResult(code="code", state="state-xyz")
+    monkeypatch.setattr(
+        auth_commands,
+        "exchange_authorization_code",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("exchange failed")),
+    )
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "emit_error",
+        lambda title, message, **kwargs: captured.append((title, message)),
+    )
+
+    with pytest.raises(typer.Exit):
+        auth_commands._run_linear_oauth_flow(force=True)
+
+    assert any("token exchange" in title.lower() for title, _ in captured)
+
+
+def test_run_linear_oauth_flow_callback_start_failure(
+    auth_cli: None,
+    linear_oauth_config: None,
+    callback_server: _FakeCallbackServer,
+    browser: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        auth_commands, "get_integration_status", lambda _p: {"authenticated": False}
+    )
+    callback_server.start_exc = OSError("port in use")
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "emit_error",
+        lambda title, message, **kwargs: captured.append((title, message)),
+    )
+
+    with pytest.raises(typer.Exit):
+        auth_commands._run_linear_oauth_flow(force=True)
+
+    assert captured
+    assert "callback failed to start" in captured[0][0].lower()
+
+
+def test_run_linear_oauth_flow_callback_timeout_after_join(
+    auth_cli: None,
+    linear_oauth_config: None,
+    callback_server: _FakeCallbackServer,
+    browser: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        auth_commands, "get_integration_status", lambda _p: {"authenticated": False}
+    )
+    callback_server.wait_exc = TimeoutError("timed out waiting")
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "emit_error",
+        lambda title, message, **kwargs: captured.append((title, message)),
+    )
+
+    with pytest.raises(typer.Exit):
+        auth_commands._run_linear_oauth_flow(force=True)
+
+    assert any("timed out" in msg.lower() for _t, msg in captured)
+
+
+def test_run_linear_oauth_flow_fallback_port_updates_redirect(
+    auth_cli: None,
+    linear_oauth_config: None,
+    callback_server: _FakeCallbackServer,
+    browser: MagicMock,
+    credential_store: InMemoryCredentialStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_port = DEFAULT_FALLBACK_CALLBACK_PORTS[0]
+    browser.open.return_value = True
+    callback_server.port = fallback_port
+    callback_server.result = OAuthCallbackResult(code="c", state="state-xyz")
+    exchanged: list[str] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "exchange_authorization_code",
+        lambda *_a, **kwargs: (
+            exchanged.append(kwargs["redirect_uri"])
+            or {"access_token": "a", "expires_at": 9999999999.0}
+        ),
+    )
+    lines: list[str] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "print_plain_line",
+        lambda message, **kwargs: lines.append(message),
+    )
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: {"authenticated": True, "login": "Ada", "auth_type": "oauth"},
+    )
+
+    auth_commands._run_linear_oauth_flow(force=True)
+
+    assert any(f"using {fallback_port}" in line for line in lines)
+    assert exchanged == [f"http://localhost:{fallback_port}/callback"]
+    browser.open.assert_called_once()
+    assert f"localhost%3A{fallback_port}" in browser.open.call_args.args[0]
+
+
+def test_run_linear_oauth_flow_webbrowser_not_opened(
+    auth_cli: None,
+    linear_oauth_config: None,
+    callback_server: _FakeCallbackServer,
+    browser: MagicMock,
+    credential_store: InMemoryCredentialStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser.open.return_value = False
+    callback_server.result = OAuthCallbackResult(code="c", state="state-xyz")
+    monkeypatch.setattr(
+        auth_commands,
+        "exchange_authorization_code",
+        lambda *_a, **_k: {"access_token": "a", "expires_at": 9999999999.0},
+    )
+    lines: list[str] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "print_plain_line",
+        lambda message, **kwargs: lines.append(message),
+    )
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: {"authenticated": True, "login": "Ada", "auth_type": "oauth"},
+    )
+
+    auth_commands._run_linear_oauth_flow(force=True)
+
+    assert any("Could not open a browser" in line for line in lines)
+
+
+def test_run_linear_oauth_flow_closes_callback_server_when_browser_raises(
+    auth_cli: None,
+    linear_oauth_config: None,
+    callback_server: _FakeCallbackServer,
+    browser: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        auth_commands, "get_integration_status", lambda _p: {"authenticated": False}
+    )
+    browser.open.side_effect = RuntimeError("browser unavailable")
+    server = callback_server
+
+    with pytest.raises(typer.Exit):
+        auth_commands._run_linear_oauth_flow(force=True)
+
+    assert server.closed is True
+
+
+def test_run_linear_oauth_flow_invalid_redirect(
+    auth_cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _p: {"authenticated": False},
+    )
+    monkeypatch.setattr(auth_commands, "get_client_id", lambda _p: "client-id")
+
+    def _bad_redirect() -> tuple[int, ...]:
+        raise ValueError("bad redirect")
+
+    monkeypatch.setattr(auth_commands, "get_callback_port_candidates", _bad_redirect)
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auth_commands,
+        "emit_error",
+        lambda title, message, **kwargs: captured.append((title, message)),
+    )
+
+    with pytest.raises(typer.Exit):
+        auth_commands._run_linear_oauth_flow(force=True)
+
+    assert captured
+    assert "redirect" in captured[0][0].lower()
+
+
+# --- test_auth_commands_linear_json.py ---
+
+
+def test_linear_refresh_emits_single_json_document(
+    auth_json_cli: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        auth_commands,
+        "get_integration_status",
+        lambda _provider: {
+            "authenticated": True,
+            "expires_at": 1,
+            "login": "nihit",
+            "email": "nihit@example.com",
+            "site_name": "Acme",
+            "auth_type": "oauth",
+        },
+    )
+    monkeypatch.setattr(auth_commands, "token_needs_refresh", lambda _expires_at: True)
+    monkeypatch.setattr(auth_commands, "_try_refresh_linear_session", lambda: True)
+
+    auth_commands._run_linear_oauth_flow()
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["ok"] is True
+    assert payload["provider"] == "linear"
+    assert payload.get("refreshed") is True

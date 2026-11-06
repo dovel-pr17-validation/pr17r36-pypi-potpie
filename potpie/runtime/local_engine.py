@@ -1,0 +1,1506 @@
+"""Local typed-engine composition over explicit Potpie runtime services."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, fields
+from typing import Any, cast
+
+from potpie.pots.resolution import (
+    ARCHIVED_POT_NEXT_ACTION,
+    archived_pot_message,
+    is_archived,
+    repo_source_index,
+)
+from potpie.runtime.clients import ClientOutcome
+from potpie.runtime.commit_access import (
+    commit_access_for,
+    commit_grant,
+    current_authorization_scope,
+)
+from potpie.runtime.selection import CatalogSelectorResolver
+from potpie.runtime.operations import EngineOperation
+from potpie.runtime.resource_manager import (
+    AuthenticatedActor,
+    AuthorizationError,
+    AuthorizationScope,
+    CompositionFingerprint,
+    ContextResourceManager,
+    ContextSelector,
+    ResourceComposition,
+    SelectionError,
+)
+from potpie_context_engine import (
+    ContextIdentity,
+    DependencyError,
+    DomainError,
+    EngineConfig,
+    EngineDependencies,
+    Failure,
+    Outcome,
+    Success,
+)
+from potpie_context_engine.application.services.resource_journal import (
+    JOURNAL_CAPTURE_ACTIVE,
+)
+from potpie_context_engine.core.api import run_in_worker_thread
+from potpie_context_engine.core.commit_service import (
+    COMMIT_ACCESS_LEVELS,
+    CommitAccessDenied,
+)
+from potpie_context_engine.core.graph_journal import JournalError
+from potpie_context_engine.core.errors import (
+    CapabilityNotImplemented,
+    ContextEngineDisabled,
+    PotNotFound,
+)
+from potpie_context_engine.core.ports.agent_context import (
+    RecordRequest as AgentRecordRequest,
+)
+from potpie_context_engine.core.ports.agent_context import (
+    ResolveRequest as AgentResolveRequest,
+)
+from potpie_context_engine.core.ports.agent_context import (
+    SearchRequest as AgentSearchRequest,
+)
+from potpie_context_engine.core.ports.graph_service import (
+    GraphCatalogRequest,
+    GraphDescribeRequest,
+    GraphEntitySearchRequest,
+    GraphReadRequest,
+)
+from potpie_context_engine.core.ports.claim_query import ClaimQueryFilter
+from potpie_context_engine.core.ports.graph.snapshot import SnapshotManifest
+from potpie_context_engine.core.ports.resource_index import ResourceIndexError
+from potpie_context_engine.core.ports.resource_store import (
+    ResourceBatchResult,
+    ResourceStoreError,
+)
+from potpie_context_engine.core.semantic_mutations import SemanticMutationRequest
+from potpie_context_engine.domain.nudge import GraphNudgeRequest
+from potpie_context_engine.domain.ingestion_event_models import (
+    IngestionSubmissionRequest,
+)
+from potpie_context_engine.requests import (
+    ApplyPreviewRequest,
+    CatalogRequest,
+    CommitRequest,
+    CommitShowRequest,
+    CommitStatusRequest,
+    CommitsRequest,
+    DataPlaneStatusRequest,
+    DescribeRequest,
+    DisableRollbackRequest,
+    EngineRequest,
+    ExportSnapshotRequest,
+    GraphSliceRequest,
+    HistoryRequest,
+    ImportSnapshotRequest,
+    InboxAddRequest,
+    InboxClaimRequest,
+    InboxCloseRequest,
+    InboxListRequest,
+    InboxMarkAppliedRequest,
+    InboxMarkRejectedRequest,
+    InboxShowRequest,
+    InspectRequest,
+    JournalStatusRequest,
+    MutateRequest,
+    NeighborhoodRequest,
+    NudgeRequest,
+    ProposeRequest,
+    QualityRequest,
+    ReadRequest,
+    RebuildCommitsRequest,
+    RecordRequest,
+    RepairRequest,
+    ResetContextRequest,
+    ResolveRequest,
+    ResourceGetRequest,
+    ResourceImportRequest,
+    ResourceIndexBuildRequest,
+    ResourceIndexRebuildRequest,
+    ResourceIndexStatusRequest,
+    ResourceListRequest,
+    ResourceRmRequest,
+    ResourceStatusRequest,
+    RevertPreviewRequest,
+    RollbackPreviewRequest,
+    SearchEntitiesRequest,
+    SearchRequest,
+    SubmitArtifactRequest,
+    SubmitEventRequest,
+    ProcessingStatusRequest,
+    VerifyCommitRequest,
+)
+from potpie_context_engine.results import (
+    DescribeResult,
+    ExportSnapshotResult,
+    GraphJournalResult,
+    ResourceIndexRebuildResult,
+    ResourceListResult,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class EngineServices:
+    """Concrete engine-owned services behind the typed engine boundary.
+
+    The local runtime composes them in-process; an embedding host composes its
+    own from one graph runtime. ``pots`` is the local pot service and may be
+    ``None`` for a host that resolves pots through its own catalog.
+    """
+
+    pots: Any
+    agent_context: Any
+    graph: Any
+    graph_workbench: Any
+    backend: Any
+    nudge: Any
+    ingestion: Any | None = None
+    ingestion_events: Any | None = None
+    resources: Any | None = None
+    """The ``ResourceFacade`` (document store + index), or ``None`` if absent."""
+
+
+class LocalActorPotCatalog:
+    """The local pot catalog: one fixed actor sees every pot in this home.
+
+    A local home has one principal, so every method ignores ``actor``.
+    """
+
+    def __init__(self, services: Any) -> None:
+        self._services = services
+
+    async def pots_for(self, actor: AuthenticatedActor) -> Sequence[Any]:
+        del actor
+        return await asyncio.to_thread(lambda: tuple(self._services.pots.list_pots()))
+
+    async def active_for(self, actor: AuthenticatedActor) -> Any | None:
+        del actor
+        return await asyncio.to_thread(self._services.pots.active_pot)
+
+    async def repo_default_for(
+        self, actor: AuthenticatedActor, repo: str
+    ) -> str | None:
+        del actor
+        return await asyncio.to_thread(
+            lambda: self._services.pots.repo_default(repo=repo)
+        )
+
+    async def repo_sources_for(self, actor: AuthenticatedActor) -> Sequence[Any]:
+        del actor
+        return await asyncio.to_thread(
+            lambda: tuple(repo_source_index(self._services.pots))
+        )
+
+
+#: The one actor of a local home, used when a local caller resolves a selector
+#: without naming an actor.
+LOCAL_ACTOR = AuthenticatedActor(actor_id="local-cli")
+
+
+class LocalContextSelectorResolver(CatalogSelectorResolver):
+    """Resolve exact, active, and repository selectors through Potpie services."""
+
+    def __init__(self, services: Any) -> None:
+        super().__init__(LocalActorPotCatalog(services))
+
+    async def resolve(  # type: ignore[override]
+        self,
+        selector: ContextSelector,
+        *,
+        actor: AuthenticatedActor = LOCAL_ACTOR,
+    ) -> Success[ContextIdentity] | Failure[SelectionError]:
+        return await super().resolve(selector, actor=actor)
+
+
+class LocalCliAuthenticator:
+    async def authenticate(self, authentication: object):
+        del authentication
+        return Success(LOCAL_ACTOR)
+
+
+class LocalCliAuthorizer:
+    """Authorize local operations; an archived pot admits only ``reset_context``.
+
+    Selection resolves an archived pot by its exact id so its graph state can
+    still be cleared (``pot archive`` on an already-archived pot). Every other
+    operation against it is refused here, so nothing reads from or writes into
+    a retired pot through the typed boundary.
+    """
+
+    def __init__(self, services: Any | None = None) -> None:
+        self._services = services
+
+    async def authorize(
+        self,
+        actor: AuthenticatedActor,
+        operation: str,
+        context: ContextIdentity,
+    ):
+        if operation != EngineOperation.RESET_CONTEXT:
+            archived = await asyncio.to_thread(self._archived_pot, context.value)
+            if archived is not None:
+                return Failure(
+                    AuthorizationError(
+                        code="pot_archived",
+                        message=archived_pot_message(archived),
+                        recommended_next_action=ARCHIVED_POT_NEXT_ACTION,
+                    )
+                )
+        return Success(
+            AuthorizationScope(
+                actor_id=actor.actor_id,
+                operation=operation,
+                context=context,
+                # The local owner holds every commit level on every pot.
+                attributes={"trust_boundary": "local_user", "commit_access": "admin"},
+            )
+        )
+
+    def _archived_pot(self, pot_id: str) -> Any | None:
+        pots = getattr(self._services, "pots", None)
+        if pots is None:
+            return None
+        try:
+            rows = pots.list_pots()
+        except Exception:  # noqa: BLE001 - selection just read the same catalog.
+            return None
+        return next(
+            (pot for pot in rows if pot.pot_id == pot_id and is_archived(pot)),
+            None,
+        )
+
+
+#: The failure code for an engine operation that raised something unexpected.
+#: Transport-neutral: the local daemon and a managed host report the same one.
+ENGINE_OPERATION_FAILED = "engine_operation_failed"
+
+
+class ServiceEngineOperations:
+    """Finite engine-owned operations backed by explicit engine services.
+
+    The one implementation of every engine operation, for the local runtime
+    and for embedding hosts alike. Sync service calls run in a worker thread
+    bridged to the calling event loop (``run_in_worker_thread``), so a host
+    whose plan or inbox store is async only (an async database pool) serves
+    every operation from the loop that owns that store.
+    """
+
+    def __init__(self, services: Any) -> None:
+        self._services = services
+
+    async def resolve(
+        self, context: ContextIdentity, request: ResolveRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.agent_context.resolve(
+                AgentResolveRequest(
+                    pot_id=context.value,
+                    task=request.task,
+                    intent=request.intent,
+                    include=request.include,
+                    exclude=request.exclude,
+                    scope=request.scope,
+                    mode=request.mode,
+                    source_policy=request.source_policy,
+                    max_items=request.max_items,
+                    as_of=request.as_of,
+                    since=request.since,
+                    until=request.until,
+                    include_invalidated=request.include_invalidated,
+                    freshness_preference=request.freshness_preference,
+                    metadata=request.metadata,
+                )
+            )
+        )
+
+    async def search(
+        self, context: ContextIdentity, request: SearchRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.agent_context.search(
+                AgentSearchRequest(
+                    pot_id=context.value,
+                    query=_required_value(request.query, "query"),
+                    include=request.include,
+                    scope=request.scope,
+                    mode=request.mode,
+                    source_policy=request.source_policy,
+                    max_items=request.max_items,
+                    intent=request.intent,
+                    metadata=request.metadata,
+                )
+            )
+        )
+
+    async def record(
+        self, context: ContextIdentity, request: RecordRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.agent_context.record(
+                AgentRecordRequest(
+                    pot_id=context.value,
+                    record_type=_required_value(request.record_type, "record_type"),
+                    summary=_required_value(request.summary, "summary"),
+                    details=request.details,
+                    scope=request.scope,
+                    source_refs=request.source_refs,
+                    idempotency_key=request.idempotency_key,
+                    metadata=request.metadata,
+                )
+            )
+        )
+
+    async def data_plane_status(
+        self, context: ContextIdentity, request: DataPlaneStatusRequest
+    ) -> Outcome[object]:
+        del request
+        return await self._call(
+            lambda: self._services.graph.data_plane_status(context.value)
+        )
+
+    async def catalog(
+        self, context: ContextIdentity, request: CatalogRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph.catalog(
+                GraphCatalogRequest(
+                    pot_id=context.value,
+                    task=request.task,
+                    subgraph=request.subgraph,
+                )
+            )
+        )
+
+    async def describe(
+        self, context: ContextIdentity, request: DescribeRequest
+    ) -> Outcome[object]:
+        del context
+        return await self._call(
+            lambda: DescribeResult(
+                self._services.graph.describe(
+                    GraphDescribeRequest(
+                        subgraph=_required_value(request.subgraph, "subgraph"),
+                        view=request.view,
+                        include_examples=request.include_examples,
+                    )
+                )
+            )
+        )
+
+    async def read(
+        self, context: ContextIdentity, request: ReadRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph.read(
+                GraphReadRequest(
+                    pot_id=context.value,
+                    subgraph=_required_value(request.subgraph, "subgraph"),
+                    view=_required_value(request.view, "view"),
+                    query=request.query,
+                    scope=request.scope,
+                    limit=request.limit,
+                    as_of=request.as_of,
+                    since=request.since,
+                    until=request.until,
+                    include_invalidated=request.include_invalidated,
+                    freshness_preference=request.freshness_preference,
+                    depth=request.depth,
+                    direction=request.direction,
+                    environment=request.environment,
+                    source_refs=request.source_refs,
+                    detail=request.detail,
+                    relations=request.relations,
+                    query_threshold=request.query_threshold,
+                )
+            )
+        )
+
+    async def search_entities(
+        self, context: ContextIdentity, request: SearchEntitiesRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph.search_entities(
+                GraphEntitySearchRequest(
+                    pot_id=context.value,
+                    query=_required_value(request.query, "query"),
+                    type=request.type,
+                    predicate=request.predicate,
+                    subgraph=request.subgraph,
+                    scope=request.scope,
+                    truth=request.truth,
+                    source_system=request.source_system,
+                    source_family=request.source_family,
+                    since=request.since,
+                    until=request.until,
+                    environment=request.environment,
+                    external_id=request.external_id,
+                    source_refs=request.source_refs,
+                    limit=request.limit,
+                    supporting_claims=request.supporting_claims,
+                )
+            )
+        )
+
+    async def mutate(
+        self, context: ContextIdentity, request: MutateRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph.mutate(
+                SemanticMutationRequest.parse(request.mutation, pot_id=context.value)
+            )
+        )
+
+    async def neighborhood(
+        self, context: ContextIdentity, request: NeighborhoodRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._inspection_neighborhood(context=context, request=request)
+        )
+
+    async def inspect(
+        self, context: ContextIdentity, request: InspectRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._inspection_neighborhood(context=context, request=request)
+        )
+
+    async def slice(
+        self, context: ContextIdentity, request: GraphSliceRequest
+    ) -> Outcome[object]:
+        """The pot's whole graph, as the explorer draws it."""
+
+        return await self._call(
+            lambda: self._services.backend.inspection.slice(
+                pot_id=context.value,
+                filter_=ClaimQueryFilter(
+                    pot_id=context.value,
+                    include_invalidated=request.include_invalidated,
+                    limit=request.limit,
+                ),
+            )
+        )
+
+    async def export_snapshot(
+        self, context: ContextIdentity, request: ExportSnapshotRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._export_snapshot(pot_id=context.value, request=request)
+        )
+
+    async def import_snapshot(
+        self, context: ContextIdentity, request: ImportSnapshotRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._import_snapshot(pot_id=context.value, request=request)
+        )
+
+    async def repair(
+        self, context: ContextIdentity, request: RepairRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.backend.analytics.repair(
+                context.value,
+                targets=request.targets,
+            )
+        )
+
+    async def reset_context(
+        self, context: ContextIdentity, request: ResetContextRequest
+    ) -> Outcome[object]:
+        from potpie_context_engine.application.services.context_reset import (
+            reset_context,
+        )
+
+        return await self._call(
+            lambda: reset_context(
+                self._services.backend,
+                self._resources_or_none(),
+                pot_id=context.value,
+                mutation_id=request.mutation_id,
+            )
+        )
+
+    async def propose(
+        self, context: ContextIdentity, request: ProposeRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.propose(
+                request.mutation,
+                pot_id=context.value,
+                ttl_seconds=request.ttl_seconds,
+                approved_by=request.approved_by,
+            )
+        )
+
+    async def commit(
+        self, context: ContextIdentity, request: CommitRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.commit(
+                _required_value(request.plan_id, "plan_id"),
+                pot_id=context.value,
+                approved_by=request.approved_by,
+                verify=request.verify,
+                defer_verification=request.defer_verification,
+                recover_stale=request.recover_stale,
+            )
+        )
+
+    async def history(
+        self, context: ContextIdentity, request: HistoryRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.history(
+                pot_id=context.value,
+                entity_key=request.entity_key,
+                claim_key=request.claim_key,
+                subgraph=request.subgraph,
+                plan_id=request.plan_id,
+                mutation_id=request.mutation_id,
+                since=request.since,
+                until=request.until,
+                limit=request.limit,
+                include_claims=request.include_claims,
+            )
+        )
+
+    async def quality(
+        self, context: ContextIdentity, request: QualityRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.quality(
+                pot_id=context.value,
+                report=_required_value(request.report, "report"),
+                subgraph=request.subgraph,
+                limit=request.limit,
+                confidence_threshold=request.confidence_threshold,
+            )
+        )
+
+    async def inbox_add(
+        self, context: ContextIdentity, request: InboxAddRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.inbox_add(
+                pot_id=context.value,
+                summary=_required_value(request.summary, "summary"),
+                details=request.details,
+                evidence=request.evidence,
+                source_refs=request.source_refs,
+                suspected_subgraphs=request.suspected_subgraphs,
+                created_by=request.created_by,
+            )
+        )
+
+    async def inbox_list(
+        self, context: ContextIdentity, request: InboxListRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.inbox_list(
+                pot_id=context.value,
+                status=request.status,
+                claimed_by=request.claimed_by,
+                suspected_subgraph=request.suspected_subgraph,
+                source_ref=request.source_ref,
+                since=request.since,
+                until=request.until,
+                limit=request.limit,
+            )
+        )
+
+    async def inbox_show(
+        self, context: ContextIdentity, request: InboxShowRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.inbox_show(
+                pot_id=context.value,
+                item_id=_required_value(request.item_id, "item_id"),
+            )
+        )
+
+    async def inbox_claim(
+        self, context: ContextIdentity, request: InboxClaimRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.inbox_claim(
+                pot_id=context.value,
+                item_id=_required_value(request.item_id, "item_id"),
+                claimed_by=_required_value(request.claimed_by, "claimed_by"),
+            )
+        )
+
+    async def inbox_mark_applied(
+        self, context: ContextIdentity, request: InboxMarkAppliedRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.inbox_mark_applied(
+                pot_id=context.value,
+                item_id=_required_value(request.item_id, "item_id"),
+                closed_by=_required_value(request.closed_by, "closed_by"),
+                linked_plan_id=request.linked_plan_id,
+                linked_mutation_id=request.linked_mutation_id,
+            )
+        )
+
+    async def inbox_mark_rejected(
+        self, context: ContextIdentity, request: InboxMarkRejectedRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.inbox_mark_rejected(
+                pot_id=context.value,
+                item_id=_required_value(request.item_id, "item_id"),
+                closed_by=_required_value(request.closed_by, "closed_by"),
+                rejection_reason=_required_value(
+                    request.rejection_reason, "rejection_reason"
+                ),
+            )
+        )
+
+    async def inbox_close(
+        self, context: ContextIdentity, request: InboxCloseRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.inbox_close(
+                pot_id=context.value,
+                item_id=_required_value(request.item_id, "item_id"),
+                closed_by=_required_value(request.closed_by, "closed_by"),
+                linked_plan_id=request.linked_plan_id,
+                linked_mutation_id=request.linked_mutation_id,
+                rejection_reason=request.rejection_reason,
+            )
+        )
+
+    async def submit_event(
+        self, context: ContextIdentity, request: SubmitEventRequest
+    ) -> Outcome[object]:
+        def submit() -> object:
+            submission = IngestionSubmissionRequest(
+                pot_id=context.value,
+                ingestion_kind=request.ingestion_kind,
+                source_channel=request.source_channel,
+                source_system=_required_value(request.source_system, "source_system"),
+                event_type=_required_value(request.event_type, "event_type"),
+                action=_required_value(request.action, "action"),
+                source_id=_required_value(request.source_id, "source_id"),
+                payload=dict(request.payload),
+                metadata=dict(request.metadata),
+                idempotency_key=request.idempotency_key,
+                dedup_key=request.dedup_key,
+                event_id=request.event_id,
+                provider=request.provider,
+                provider_host=request.provider_host,
+                repo_name=request.repo_name,
+                source_event_id=request.source_event_id,
+                artifact_refs=request.artifact_refs,
+                occurred_at=request.occurred_at,
+                actor=request.actor,
+            )
+            return self._ingestion_submission().submit(
+                submission,
+                wait=request.wait,
+                timeout_seconds=request.timeout_seconds,
+            )
+
+        return await self._call(submit)
+
+    async def submit_artifact(
+        self, context: ContextIdentity, request: SubmitArtifactRequest
+    ) -> Outcome[object]:
+        def submit() -> object:
+            source_system = _required_value(request.source_system, "source_system")
+            artifact_type = _required_value(request.artifact_type, "artifact_type")
+            artifact_id = _required_value(request.artifact_id, "artifact_id")
+            source_ref = request.source_ref or (
+                f"{source_system}:{artifact_type}:{artifact_id}"
+            )
+            submission = IngestionSubmissionRequest(
+                pot_id=context.value,
+                ingestion_kind="artifact_evidence",
+                source_channel=request.source_channel,
+                source_system=source_system,
+                event_type="artifact",
+                action=artifact_type,
+                source_id=artifact_id,
+                payload={"artifact": dict(request.artifact), "source_ref": source_ref},
+                metadata=dict(request.metadata),
+                idempotency_key=request.idempotency_key,
+                provider=request.provider,
+                provider_host=request.provider_host,
+                repo_name=request.repo_name,
+                artifact_refs=(source_ref,),
+                occurred_at=request.occurred_at,
+                actor=request.actor,
+            )
+            return self._ingestion_submission().submit(
+                submission,
+                wait=request.wait,
+                timeout_seconds=request.timeout_seconds,
+            )
+
+        return await self._call(submit)
+
+    async def processing_status(
+        self, context: ContextIdentity, request: ProcessingStatusRequest
+    ) -> Outcome[object]:
+        event_id = _required_value(request.event_id, "event_id")
+        try:
+            event = await run_in_worker_thread(
+                self._ingestion_event_store().get_event, event_id
+            )
+        except Exception as exc:
+            return await self._dependency_failure("processing_status", exc)
+        if event is None or event.pot_id != context.value:
+            return Failure(
+                DomainError(
+                    code="processing_status_not_found",
+                    message="the requested evidence-processing event was not found",
+                    details={"event_id": event_id},
+                )
+            )
+        return Success(event)
+
+    async def nudge(
+        self, context: ContextIdentity, request: NudgeRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.nudge.nudge(
+                GraphNudgeRequest(
+                    pot_id=context.value,
+                    event=_required_value(request.event, "event"),
+                    session_id=_required_value(request.session_id, "session_id"),
+                    scope=request.scope,
+                    path=request.path,
+                    query=request.query,
+                    limit=request.limit,
+                )
+            )
+        )
+
+    # --- document resources -------------------------------------------------
+
+    async def resource_import(
+        self, context: ContextIdentity, request: ResourceImportRequest
+    ) -> Outcome[object]:
+        # Contents only, never a path: see ``ResourceImportRequest``.
+        return await self._call(
+            lambda: self._resources().import_dir(
+                pot_id=context.value,
+                slug=_required_value(request.doc, "doc"),
+                files=dict(request.files),
+                source_ref=request.source_ref,
+                source_kind=request.source_kind,
+            )
+        )
+
+    async def resource_get(
+        self, context: ContextIdentity, request: ResourceGetRequest
+    ) -> Outcome[object]:
+        def get() -> ResourceBatchResult:
+            if not request.resource_ids:
+                raise ValueError("resource_ids is required")
+            result = self._resources().get(
+                pot_id=context.value,
+                resource_ids=tuple(request.resource_ids),
+                with_neighbors=request.with_neighbors,
+            )
+            if isinstance(result, ResourceBatchResult):
+                return result
+            # Every id resolved: the facade keeps its historical tuple shape,
+            # the typed boundary always answers one batch receipt.
+            return ResourceBatchResult(
+                chunks=tuple(result), outcomes=(), status="success"
+            )
+
+        return await self._call(get)
+
+    async def resource_list(
+        self, context: ContextIdentity, request: ResourceListRequest
+    ) -> Outcome[object]:
+        def list_sections() -> ResourceListResult:
+            doc = _required_value(request.doc, "doc")
+            return ResourceListResult(
+                doc=doc,
+                sections=tuple(
+                    self._resources().list(
+                        pot_id=context.value, slug=doc, section=request.section
+                    )
+                ),
+            )
+
+        return await self._call(list_sections)
+
+    async def resource_rm(
+        self, context: ContextIdentity, request: ResourceRmRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._resources().delete(
+                pot_id=context.value, slug=_required_value(request.doc, "doc")
+            )
+        )
+
+    async def resource_status(
+        self, context: ContextIdentity, request: ResourceStatusRequest
+    ) -> Outcome[object]:
+        del request
+        return await self._call(lambda: self._resources().status(pot_id=context.value))
+
+    async def resource_index_status(
+        self, context: ContextIdentity, request: ResourceIndexStatusRequest
+    ) -> Outcome[object]:
+        del request
+        return await self._call(
+            lambda: self._resources().index_status(pot_id=context.value)
+        )
+
+    async def resource_index_build(
+        self, context: ContextIdentity, request: ResourceIndexBuildRequest
+    ) -> Outcome[object]:
+        def build() -> object:
+            resources = self._resources()
+            # Pending work is per pot, so ``doc`` narrows by re-deriving that
+            # document's rows first; that is what makes it mean something on a
+            # document whose index rows are missing entirely.
+            if request.doc:
+                resources.index_rebuild(pot_id=context.value, doc=request.doc)
+            return resources.index_build(pot_id=context.value, wait=request.wait)
+
+        return await self._call(build)
+
+    async def resource_index_rebuild(
+        self, context: ContextIdentity, request: ResourceIndexRebuildRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: ResourceIndexRebuildResult(
+                reports=tuple(
+                    self._resources().index_rebuild(
+                        pot_id=context.value, doc=request.doc or None
+                    )
+                )
+            )
+        )
+
+    async def commit_status(
+        self, context: ContextIdentity, request: CommitStatusRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.commit_status(
+                _required_value(request.plan_id, "plan_id"), pot_id=context.value
+            )
+        )
+
+    async def verify_commit(
+        self, context: ContextIdentity, request: VerifyCommitRequest
+    ) -> Outcome[object]:
+        return await self._call(
+            lambda: self._services.graph_workbench.verify_commit(
+                _required_value(request.plan_id, "plan_id"), pot_id=context.value
+            )
+        )
+
+    async def journal_status(
+        self, context: ContextIdentity, request: JournalStatusRequest
+    ) -> Outcome[object]:
+        del request
+        return await self._journal(
+            "journal_status",
+            context,
+            lambda commits: commits.journal_status_async(pot_id=context.value),
+        )
+
+    async def commits(
+        self, context: ContextIdentity, request: CommitsRequest
+    ) -> Outcome[object]:
+        return await self._journal(
+            "commits",
+            context,
+            lambda commits: commits.commits_async(
+                pot_id=context.value,
+                cursor=request.cursor,
+                limit=request.limit,
+                actor=request.actor,
+                origin=request.origin,
+                logical_key=request.logical_key,
+            ),
+        )
+
+    async def commit_show(
+        self, context: ContextIdentity, request: CommitShowRequest
+    ) -> Outcome[object]:
+        return await self._journal(
+            "commit_show",
+            context,
+            lambda commits: commits.commit_show_async(
+                _required_value(request.commit_id, "commit_id"),
+                pot_id=context.value,
+                offset=request.offset,
+                limit=request.limit,
+            ),
+        )
+
+    async def revert_preview(
+        self, context: ContextIdentity, request: RevertPreviewRequest
+    ) -> Outcome[object]:
+        return await self._journal(
+            "revert_preview",
+            context,
+            lambda commits: commits.revert_preview_async(
+                _required_value(request.commit_id, "commit_id"),
+                pot_id=context.value,
+                expected_head=_required_value(request.expected_head, "expected_head"),
+            ),
+        )
+
+    async def rollback_preview(
+        self, context: ContextIdentity, request: RollbackPreviewRequest
+    ) -> Outcome[object]:
+        return await self._journal(
+            "rollback_preview",
+            context,
+            lambda commits: commits.rollback_preview_async(
+                _required_value(request.target_commit_id, "target_commit_id"),
+                pot_id=context.value,
+                expected_head=_required_value(request.expected_head, "expected_head"),
+            ),
+        )
+
+    async def apply_preview(
+        self, context: ContextIdentity, request: ApplyPreviewRequest
+    ) -> Outcome[object]:
+        return await self._journal(
+            "apply_preview",
+            context,
+            lambda commits: commits.apply_preview_async(
+                _required_value(request.preview_id, "preview_id"),
+                pot_id=context.value,
+            ),
+        )
+
+    async def disable_rollback(
+        self, context: ContextIdentity, request: DisableRollbackRequest
+    ) -> Outcome[object]:
+        del request
+        return await self._journal(
+            "disable_rollback",
+            context,
+            lambda commits: commits.disable_rollback_async(pot_id=context.value),
+        )
+
+    async def rebuild_commits(
+        self, context: ContextIdentity, request: RebuildCommitsRequest
+    ) -> Outcome[object]:
+        del request
+        return await self._journal(
+            "rebuild_commits",
+            context,
+            lambda commits: commits.rebuild_commits_async(pot_id=context.value),
+        )
+
+    async def _journal(
+        self,
+        operation: str,
+        context: ContextIdentity,
+        call: Callable[[Any], Awaitable[Any]],
+    ) -> Outcome[object]:
+        result = await self._authorized_graph_call(operation, context, call)
+        if isinstance(result, Failure):
+            return result
+        return Success(GraphJournalResult.from_value(result.value))
+
+    async def _authorized_graph_call(
+        self,
+        operation: str,
+        context: ContextIdentity,
+        call: Callable[[Any], Awaitable[Any]],
+    ) -> Outcome[object]:
+        """Run one commit-service call inside this pot's commit grant.
+
+        Every call that reaches here passed the resource manager, which
+        authenticated the caller and authorized this operation for exactly
+        this pot, so the grant is scoped to that pot and nothing wider. Its
+        levels are the ones the authorized scope carries; a call made outside
+        the typed boundary (in-process, local only) keeps every level.
+        """
+
+        scope = current_authorization_scope()
+        access = commit_access_for(scope) if scope is not None else COMMIT_ACCESS_LEVELS
+        try:
+            with commit_grant(context.value, access):
+                value = await call(self._services.graph_workbench)
+        except CommitAccessDenied as exc:
+            return Failure(
+                DomainError(
+                    code="commit_access_denied",
+                    message=str(exc),
+                    details={"operation": operation},
+                )
+            )
+        except ValueError as exc:
+            return Failure(
+                DomainError(
+                    code="validation_error",
+                    message=str(exc),
+                    details={"operation": operation},
+                )
+            )
+        except Exception as exc:
+            return await self._dependency_failure(operation, exc)
+        return Success(value)
+
+    async def invoke(
+        self,
+        operation: EngineOperation,
+        context: ContextIdentity,
+        request: EngineRequest,
+    ) -> ClientOutcome:
+        handlers: dict[
+            EngineOperation,
+            Callable[[ContextIdentity, Any], Awaitable[Outcome[object]]],
+        ] = {
+            EngineOperation.RESOLVE: self.resolve,
+            EngineOperation.SEARCH: self.search,
+            EngineOperation.RECORD: self.record,
+            EngineOperation.DATA_PLANE_STATUS: self.data_plane_status,
+            EngineOperation.CATALOG: self.catalog,
+            EngineOperation.DESCRIBE: self.describe,
+            EngineOperation.READ: self.read,
+            EngineOperation.SEARCH_ENTITIES: self.search_entities,
+            EngineOperation.MUTATE: self.mutate,
+            EngineOperation.NEIGHBORHOOD: self.neighborhood,
+            EngineOperation.INSPECT: self.inspect,
+            EngineOperation.GRAPH_SLICE: self.slice,
+            EngineOperation.EXPORT_SNAPSHOT: self.export_snapshot,
+            EngineOperation.IMPORT_SNAPSHOT: self.import_snapshot,
+            EngineOperation.REPAIR: self.repair,
+            EngineOperation.RESET_CONTEXT: self.reset_context,
+            EngineOperation.PROPOSE: self.propose,
+            EngineOperation.COMMIT: self.commit,
+            EngineOperation.HISTORY: self.history,
+            EngineOperation.QUALITY: self.quality,
+            EngineOperation.INBOX_ADD: self.inbox_add,
+            EngineOperation.INBOX_LIST: self.inbox_list,
+            EngineOperation.INBOX_SHOW: self.inbox_show,
+            EngineOperation.INBOX_CLAIM: self.inbox_claim,
+            EngineOperation.INBOX_MARK_APPLIED: self.inbox_mark_applied,
+            EngineOperation.INBOX_MARK_REJECTED: self.inbox_mark_rejected,
+            EngineOperation.INBOX_CLOSE: self.inbox_close,
+            EngineOperation.SUBMIT_EVENT: self.submit_event,
+            EngineOperation.SUBMIT_ARTIFACT: self.submit_artifact,
+            EngineOperation.PROCESSING_STATUS: self.processing_status,
+            EngineOperation.NUDGE: self.nudge,
+            EngineOperation.RESOURCE_IMPORT: self.resource_import,
+            EngineOperation.RESOURCE_GET: self.resource_get,
+            EngineOperation.RESOURCE_LIST: self.resource_list,
+            EngineOperation.RESOURCE_RM: self.resource_rm,
+            EngineOperation.RESOURCE_STATUS: self.resource_status,
+            EngineOperation.RESOURCE_INDEX_STATUS: self.resource_index_status,
+            EngineOperation.RESOURCE_INDEX_BUILD: self.resource_index_build,
+            EngineOperation.RESOURCE_INDEX_REBUILD: self.resource_index_rebuild,
+            EngineOperation.COMMIT_STATUS: self.commit_status,
+            EngineOperation.VERIFY_COMMIT: self.verify_commit,
+            EngineOperation.JOURNAL_STATUS: self.journal_status,
+            EngineOperation.COMMITS: self.commits,
+            EngineOperation.COMMIT_SHOW: self.commit_show,
+            EngineOperation.REVERT_PREVIEW: self.revert_preview,
+            EngineOperation.ROLLBACK_PREVIEW: self.rollback_preview,
+            EngineOperation.APPLY_PREVIEW: self.apply_preview,
+            EngineOperation.DISABLE_ROLLBACK: self.disable_rollback,
+            EngineOperation.REBUILD_COMMITS: self.rebuild_commits,
+        }
+        handler = handlers.get(operation)
+        if handler is None:
+            return Failure(
+                DomainError(
+                    code="operation_not_supported",
+                    message=f"{operation.value} is not supported by this engine",
+                )
+            )
+        return await handler(context, request)
+
+    def _inspection_neighborhood(
+        self,
+        *,
+        context: ContextIdentity,
+        request: NeighborhoodRequest | InspectRequest,
+    ) -> object:
+        capabilities = self._services.backend.capabilities()
+        if not bool(getattr(capabilities, "inspection", False)):
+            profile = getattr(
+                capabilities,
+                "profile",
+                getattr(self._services.backend, "profile", "unknown"),
+            )
+            raise CapabilityNotImplemented(
+                f"graph.{profile}.inspection.neighborhood",
+                detail=(
+                    "graph neighborhood is not supported by the active "
+                    f"'{profile}' backend"
+                ),
+                recommended_next_action=(
+                    "run 'potpie backend status' to inspect capabilities, or switch "
+                    "to a backend that implements inspection"
+                ),
+            )
+        return self._services.backend.inspection.neighborhood(
+            pot_id=context.value,
+            entity_key=_required_value(request.entity_key, "entity_key"),
+            depth=request.depth,
+            direction=request.direction,
+            predicates=request.predicates,
+            limit=request.limit,
+        )
+
+    def _snapshot_port(self, method: str) -> object:
+        capabilities = self._services.backend.capabilities()
+        if not bool(getattr(capabilities, "snapshot", False)):
+            profile = getattr(
+                capabilities,
+                "profile",
+                getattr(self._services.backend, "profile", "unknown"),
+            )
+            raise CapabilityNotImplemented(
+                f"graph.{profile}.snapshot.{method}",
+                detail=(
+                    "snapshot operations are not supported by the executing "
+                    f"'{profile}' backend"
+                ),
+                recommended_next_action=(
+                    "inspect the selected runtime backend or switch to one that "
+                    "implements snapshot operations"
+                ),
+            )
+        return self._services.backend.snapshot
+
+    def _export_snapshot(
+        self, *, pot_id: str, request: ExportSnapshotRequest
+    ) -> ExportSnapshotResult:
+        version = _snapshot_request_version(request.version)
+        if version == 1:
+            manifest = self._snapshot_port("export").export(
+                pot_id=pot_id,
+                destination=_required_value(request.destination, "destination"),
+            )
+            return ExportSnapshotResult(
+                **{
+                    item.name: getattr(manifest, item.name)
+                    for item in fields(SnapshotManifest)
+                }
+            )
+        if request.destination:
+            raise ValueError(
+                "a version 2 snapshot export takes no destination: the snapshot "
+                "is returned as data and the caller writes the files"
+            )
+        snapshot = self._snapshot_port("export_data")
+        if request.include_resources:
+            payload = dict(
+                self._snapshot_resources("export_snapshot").export_snapshot(
+                    pot_id=pot_id
+                )
+            )
+        else:
+            payload = dict(snapshot.export_data(pot_id=pot_id))
+        metadata: dict[str, Any] = {}
+        resources = payload.get("resources")
+        if isinstance(resources, Mapping):
+            metadata["documents"] = _snapshot_document_count(resources)
+        return ExportSnapshotResult(
+            pot_id=pot_id,
+            location="",
+            format_version=str(payload.get("format_version") or "2"),
+            entity_count=len(payload.get("entities") or ()),
+            claim_count=len(payload.get("claims") or ()),
+            metadata=metadata,
+            payload=payload,
+        )
+
+    def _import_snapshot(
+        self, *, pot_id: str, request: ImportSnapshotRequest
+    ) -> object:
+        version = _snapshot_request_version(request.version)
+        identity = (
+            {"mutation_id": request.mutation_id}
+            if request.mutation_id is not None
+            else {}
+        )
+        if version == 1:
+            if request.payload:
+                raise ValueError(
+                    "a version 1 snapshot import reads 'source'; send the "
+                    "snapshot as 'payload' with version 2"
+                )
+            return self._snapshot_port("import_").import_(
+                pot_id=pot_id,
+                source=_required_value(request.source, "source"),
+                **identity,
+            )
+        if request.source:
+            raise ValueError(
+                "a version 2 snapshot import takes no source path: send the "
+                "snapshot itself as 'payload'"
+            )
+        if not request.payload:
+            raise ValueError("payload is required for a version 2 snapshot import")
+        snapshot = self._snapshot_port("import_data")
+        payload = dict(request.payload)
+        if "resources" in payload:
+            # Graph and document text restore together: resource bytes are
+            # staged and rolled back if the graph import fails.
+            return self._snapshot_resources("import_snapshot").import_snapshot(
+                pot_id=pot_id, payload=payload, **identity
+            )
+        return snapshot.import_data(pot_id=pot_id, payload=payload, **identity)
+
+    def _snapshot_resources(self, method: str) -> Any:
+        resources = self._resources_or_none()
+        if resources is None:
+            raise CapabilityNotImplemented(
+                f"resources.{method}",
+                detail=(
+                    "this runtime does not compose a document resource store, so "
+                    "a snapshot cannot carry document text"
+                ),
+                recommended_next_action=(
+                    "retry with --graph-only to move only graph entities and claims"
+                ),
+            )
+        return resources
+
+    def _resources_or_none(self) -> Any | None:
+        return getattr(self._services, "resources", None)
+
+    def _resources(self) -> Any:
+        resources = self._resources_or_none()
+        if resources is None:
+            raise CapabilityNotImplemented(
+                "resources",
+                detail="this runtime does not compose a document resource store",
+                recommended_next_action=(
+                    "run against the local Potpie runtime, which composes one"
+                ),
+            )
+        return resources
+
+    def _ingestion_submission(self) -> Any:
+        service = self._services.ingestion
+        if service is None:
+            raise ContextEngineDisabled("evidence submission is not composed")
+        return service
+
+    def _ingestion_event_store(self) -> Any:
+        store = self._services.ingestion_events
+        if store is None:
+            raise ContextEngineDisabled("evidence status storage is not composed")
+        return store
+
+    async def _dependency_failure(
+        self, operation: str, exc: Exception
+    ) -> Failure[DependencyError]:
+        return Failure(
+            DependencyError(
+                code=ENGINE_OPERATION_FAILED,
+                message="the engine operation failed",
+                details={"operation": operation, "error_type": type(exc).__name__},
+                recommended_next_action="inspect runtime logs",
+            )
+        )
+
+    async def _call(self, call: Callable[[], object]) -> Outcome[object]:
+        try:
+            return Success(await run_in_worker_thread(call))
+        except CapabilityNotImplemented as exc:
+            return Failure(
+                DomainError(
+                    code="not_implemented",
+                    message=str(exc),
+                    details={"detail": exc.detail} if exc.detail else {},
+                    recommended_next_action=exc.recommended_next_action,
+                )
+            )
+        except PotNotFound as exc:
+            return Failure(DomainError(code="pot_not_found", message=str(exc)))
+        except (ResourceStoreError, ResourceIndexError) as exc:
+            # The store's own stable code, not ``validation_error``: an agent
+            # retries a bad slug and an oversized chunk differently.
+            return Failure(
+                DomainError(
+                    code=exc.code,
+                    message=str(exc),
+                    details={"detail": exc.detail} if exc.detail is not None else {},
+                    recommended_next_action=exc.recommended_next_action,
+                )
+            )
+        except JournalError as exc:
+            if exc.code == JOURNAL_CAPTURE_ACTIVE:
+                return Failure(
+                    DomainError(
+                        code=JOURNAL_CAPTURE_ACTIVE,
+                        message=str(exc),
+                        recommended_next_action=(
+                            "inspect the pot's journal with 'potpie graph "
+                            "journal-status'; no command retires journal "
+                            "capture yet"
+                        ),
+                    )
+                )
+            return Failure(
+                DomainError(
+                    code="validation_error",
+                    message=str(exc),
+                    details={"detail": getattr(exc, "detail", None)},
+                )
+            )
+        except ValueError as exc:
+            return Failure(
+                DomainError(
+                    code="validation_error",
+                    message=str(exc),
+                    details={
+                        "detail": getattr(exc, "detail", None),
+                    },
+                    recommended_next_action=getattr(
+                        exc, "recommended_next_action", None
+                    ),
+                )
+            )
+        except ContextEngineDisabled as exc:
+            return Failure(
+                DependencyError(
+                    code="unavailable",
+                    message=str(exc),
+                    # A graph store that refuses to serve possibly stale data
+                    # names its own repair; keep it instead of the generic one.
+                    recommended_next_action=(
+                        getattr(exc, "recommended_next_action", None)
+                        or "check backend/daemon readiness with 'potpie doctor'"
+                    ),
+                    retry_posture="safe",
+                )
+            )
+        except Exception as exc:
+            return Failure(
+                DependencyError(
+                    code=ENGINE_OPERATION_FAILED,
+                    message="the engine operation failed",
+                    details={"error_type": type(exc).__name__},
+                    recommended_next_action="inspect runtime logs",
+                )
+            )
+
+
+class GraphMetadataOperationHandler:
+    """Shared context-free graph metadata execution (``describe``)."""
+
+    def __init__(self, services: EngineServices) -> None:
+        self._operations = ServiceEngineOperations(services)
+
+    async def handle(
+        self, operation: EngineOperation, request: EngineRequest
+    ) -> ClientOutcome:
+        if operation is not EngineOperation.DESCRIBE:
+            return Failure(
+                DomainError(
+                    code="unsupported_context_free_operation",
+                    message=f"{operation.value} is not a context-free operation",
+                )
+            )
+        return await self._operations.describe(
+            ContextIdentity("context-free"), cast(DescribeRequest, request)
+        )
+
+
+class ServiceResourceComposer:
+    """Compose one context-bound engine over shared engine services.
+
+    Each cached engine is a thin wrapper: every context shares the same
+    services, so composition is cheap and an evicted engine costs nothing to
+    rebuild.
+    """
+
+    def __init__(self, services: Any) -> None:
+        self._services = services
+
+    async def fingerprint(self, context: ContextIdentity):
+        del context
+        profile = str(getattr(self._services.backend, "profile", "unknown"))
+        return Success(CompositionFingerprint(f"local-engine-v1:{profile}"))
+
+    async def compose(
+        self, context: ContextIdentity, fingerprint: CompositionFingerprint
+    ):
+        operations = ServiceEngineOperations(self._services)
+        return Success(
+            ResourceComposition(
+                fingerprint=fingerprint,
+                config=EngineConfig(values={"backend_profile": fingerprint.value}),
+                dependencies=EngineDependencies(
+                    context=operations,
+                    graph=operations,
+                    workbench=operations,
+                    ingestion=operations,
+                    nudge=operations,
+                    documents=operations,
+                ),
+            )
+        )
+
+
+#: The local names, kept for existing callers.
+LocalEngineServices = EngineServices
+LocalEngineOperations = ServiceEngineOperations
+LocalContextResourceComposer = ServiceResourceComposer
+LocalGraphMetadataOperationHandler = GraphMetadataOperationHandler
+
+
+def build_local_resource_manager(services: Any) -> ContextResourceManager:
+    return ContextResourceManager(
+        resolver=LocalContextSelectorResolver(services),
+        authenticator=LocalCliAuthenticator(),
+        authorizer=LocalCliAuthorizer(services),
+        composer=ServiceResourceComposer(services),
+    )
+
+
+def _required_value(value: str | None, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} is required")
+    return value
+
+
+def _snapshot_request_version(version: object) -> int:
+    if isinstance(version, bool) or version not in (1, 2):
+        raise ValueError(
+            f"unsupported snapshot request version {version!r}; expected 1 or 2"
+        )
+    return cast(int, version)
+
+
+def _snapshot_document_count(resources: Mapping[str, Any]) -> int:
+    """How many documents a snapshot's resource files belong to."""
+
+    files = resources.get("files")
+    if not isinstance(files, Mapping):
+        return 0
+    return len({str(name).split("/", 1)[0] for name in files})
+
+
+__all__ = [
+    "ENGINE_OPERATION_FAILED",
+    "LOCAL_ACTOR",
+    "EngineServices",
+    "GraphMetadataOperationHandler",
+    "LocalActorPotCatalog",
+    "LocalCliAuthenticator",
+    "LocalCliAuthorizer",
+    "LocalContextResourceComposer",
+    "LocalContextSelectorResolver",
+    "LocalEngineOperations",
+    "LocalEngineServices",
+    "LocalGraphMetadataOperationHandler",
+    "ServiceEngineOperations",
+    "ServiceResourceComposer",
+    "build_local_resource_manager",
+]

@@ -1,0 +1,190 @@
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.hooks.custom]
+path = "scripts/distribution_defaults_hook.py"
+
+[project]
+name = "potpie"
+version = "2.0.1"
+description = "Potpie product distribution"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Potpie AI", email = "engineering@potpie.ai" }]
+maintainers = [{ name = "Potpie AI", email = "engineering@potpie.ai" }]
+keywords = ["ai", "agents", "code-intelligence", "knowledge-graph", "developer-tools"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+]
+dependencies = [
+    "aiohttp>=3.14.3",
+    "click>=8.1.8",
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "potpie-context-engine[http,local]==0.2.0",
+    "rich>=13.0",
+    "starlette>=1.3.1",
+    "typer>=0.15.0",
+    "uvicorn[standard]>=0.32.0",
+]
+
+[project.optional-dependencies]
+daemon = ["potpie-context-engine[http]"]
+local = ["potpie-context-engine[local]"]
+auth = ["keyring>=25.0.0"]
+embeddings = ["potpie-context-engine[embeddings]"]
+ingest = [
+    "potpie-context-engine[github,reconciliation-agent]",
+    "pydantic-ai-slim>=2.53.0",
+    "pyjwt>=2.15.0",
+]
+telemetry = [
+    "potpie-context-engine[observability]",
+    "sentry-sdk>=2.61.1,<3.0.0",
+]
+ui = ["pillow>=12.3.0"]
+all = [
+    "potpie[daemon,local,auth,embeddings,ingest,telemetry,ui]",
+    "potpie-context-engine[all]",
+    "pydantic-settings>=2.14.2",
+]
+
+[project.scripts]
+potpie = "potpie.cli.main:main"
+potpie-daemon = "potpie.daemon.__main__:main"
+
+[project.urls]
+Homepage = "https://potpie.ai"
+Documentation = "https://docs.potpie.ai"
+Source = "https://github.com/potpie-ai/potpie"
+Issues = "https://github.com/potpie-ai/potpie/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["potpie"]
+include = [
+    "potpie/cli/templates/**/*",
+    "potpie/cli/ui/assets/**/*",
+    "potpie/daemon/http/ui/frontend/dist/**/*",
+]
+exclude = [
+    "**/tests/**",
+    "/potpie/context-engine",
+    "/potpie/daemon/http/ui/frontend/*",
+    "!/potpie/daemon/http/ui/frontend/dist",
+    "/potpie/integrations",
+    "/potpie/parsing",
+]
+skip-excluded-dirs = true
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/LICENSE",
+    "/README.md",
+    "/pyproject.toml",
+    "/scripts/build_config_values.py",
+    "/scripts/distribution_defaults_hook.py",
+    "/scripts/generate-potpie-ascii.mjs",
+    "/scripts/context_engine_lab.py",
+    "/potpie/__init__.py",
+    "/potpie/agent_context.py",
+    "/potpie/auth",
+    "/potpie/build_info.py",
+    "/potpie/cli",
+    "/potpie/config",
+    "/potpie/daemon",
+    "/potpie/pots",
+    "/potpie/runtime",
+    "/potpie/setup",
+    "/potpie/skills",
+]
+exclude = [
+    "/.gitignore",
+    "/potpie/context-engine",
+    "/potpie/daemon/http/ui/frontend/node_modules",
+    "/potpie/integrations",
+    "/potpie/parsing",
+]
+
+[tool.uv]
+override-dependencies = [
+    "python-dotenv>=1.2.2",
+    "openai>=2.7.1",
+    "idna>=3.15",
+    "cryptography>=50.0.0",
+    "aiohttp>=3.14.3",
+    "gitpython>=3.1.58",
+    "starlette>=1.3.1",
+    "pyjwt>=2.15.0",
+    "urllib3>=2.8.0",
+    "virtualenv>=21.7.13",
+    "pydantic-settings>=2.14.2",
+    "pydantic-ai-slim>=2.53.0",
+    "torch>=2.13.0",
+    "httpx2>=2.12.0",
+    "httpcore2>=2.10.0",
+    "anyio>=4.14.2",
+    "soupsieve>=2.9.0",
+    "multidict>=6.9.1",
+    "fsspec>=2026.6.0",
+]
+
+[tool.uv.workspace]
+members = [
+    "potpie/context-engine",
+    "potpie/integrations",
+    "potpie/parsing",
+]
+exclude = ["scripts/packaging/falkordblite"]
+
+[tool.uv.sources]
+potpie-context-engine = { workspace = true, editable = true }
+potpie-falkordblite = { path = "scripts/packaging/falkordblite" }
+
+[dependency-groups]
+dev = [
+    "black>=26.3.1",
+    "isort>=7.0.0",
+    "pre-commit>=4.3.0",
+    "pylint>=4.0.2",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.2.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.14.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+norecursedirs = ["build", "dist", "node_modules", "venv", "*.egg", "docs"]
+addopts = "-v --tb=short"
+asyncio_mode = "auto"
+markers = [
+    "unit: unit tests",
+    "integration: integration tests (no external services required, but exercise real third-party libs)",
+    "cli_auth_e2e: opt-in live CLI auth tests (Linear/Jira/Confluence); requires RUN_CLI_AUTH_E2E=1",
+    "source_contract: inspect repository sources or build and test controls",
+]
+
+[tool.ruff.lint]
+extend-select = ["S"]
+
+[tool.ruff.lint.per-file-ignores]
+"potpie/cli/commands/_common.py" = ["S112"]
+"potpie/cli/ui/setup_ux.py" = ["S112"]
+"tests/_auth_fakes.py" = ["S108"]
+"tests/auth/test_cli_linear.py" = ["S310"]
+"tests/packaging/test_build_hook_config.py" = ["S101"]
+"tests/packaging/test_validate_python_release.py" = ["S101"]
+"tests/packaging/test_verify_pypi_release.py" = ["S101"]

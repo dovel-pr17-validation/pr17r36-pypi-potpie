@@ -1,0 +1,67 @@
+"""Shared graph writer port.
+
+Concrete graph stores implement this narrow async mutation adapter. It is
+intentionally storage-adapter internal: application services depend on
+``GraphBackend`` / ``GraphMutationPort`` instead.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Iterable, Protocol
+from potpie_context_engine.core.ports.claim_query import ClaimRow
+
+from potpie_context_engine.core.graph_mutations import (
+    EdgeDelete,
+    EdgeUpsert,
+    EntityUpsert,
+    InvalidationOp,
+    ProvenanceRef,
+)
+
+
+class GraphWriterPort(Protocol):
+    """The deterministic graph mutation surface used by backend adapters."""
+
+    @property
+    def enabled(self) -> bool: ...
+
+    async def ensure_indexes(self) -> bool:
+        """Idempotently create entity / claim / vector indexes."""
+        ...
+
+    async def claim_rows(
+        self,
+        pot_id: str,
+        *,
+        record_ids: Iterable[str] = (),
+        history_scopes: Iterable[tuple[str, str]] = (),
+        corrections: Iterable[EdgeDelete | InvalidationOp] = (),
+    ) -> list[ClaimRow]:
+        """Read complete selected histories within the writer's atomic boundary.
+
+        Empty scopes return no rows; they must never select the entire pot.
+        """
+        ...
+
+    async def upsert_entities(
+        self, pot_id: str, items: list[EntityUpsert], provenance: ProvenanceRef
+    ) -> int: ...
+
+    async def upsert_edges(
+        self, pot_id: str, items: list[EdgeUpsert], provenance: ProvenanceRef
+    ) -> int: ...
+
+    async def delete_edges(
+        self, pot_id: str, items: list[EdgeDelete], provenance: ProvenanceRef
+    ) -> int: ...
+
+    async def invalidate(
+        self, pot_id: str, items: list[InvalidationOp], provenance: ProvenanceRef
+    ) -> int: ...
+
+    async def reset_pot(
+        self, pot_id: str, *, mutation_id: str | None = None
+    ) -> dict[str, Any]: ...
+
+
+__all__ = ["GraphWriterPort"]

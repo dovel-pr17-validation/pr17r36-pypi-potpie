@@ -1,0 +1,231 @@
+"""Apply a validated :class:`MutationBatch` to the graph.
+
+One function, one async path. The caller produced the batch; this routine
+uses a caller-reserved ``mutation_id`` when present (or generates one),
+stamps it into provenance, and runs the four mutation verbs against the single
+:class:`GraphWriterPort`. No episodic narrative, no sync→async bridge.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from uuid import uuid4
+from copy import deepcopy
+from potpie_context_engine.core.claim_corrections import (
+    SupersessionBinding,
+    prepare_claim_closures,
+)
+from potpie_context_engine.core.claim_preparation import prepare_assertions_from_rows
+from .claim_reads import candidate_scope
+
+from potpie_context_engine.adapters.outbound.graph.writer_port import GraphWriterPort
+from potpie_context_engine.core.reconciliation_validation import (
+    validate_mutation_batch,
+)
+from potpie_context_engine.core.definition import (
+    DEFAULT_GRAPH_DEFINITION,
+    GraphDefinition,
+)
+from potpie_context_engine.core.errors import ReconciliationApplyError
+from potpie_context_engine.core.graph_mutations import (
+    ProvenanceContext,
+    ProvenanceRef,
+)
+from potpie_context_engine.core.graph_plans import mutation_batch_to_dict
+from potpie_context_engine.core.reconciliation import (
+    MutationBatch,
+    MutationResult,
+    MutationSummary,
+)
+from potpie_context_engine.core.reconciliation_config import ReconciliationConfig
+
+
+def _stable_batch_source_id(plan: MutationBatch) -> str:
+    """Deterministic provenance source id for an event-ref-less, context-less batch.
+
+    The execution ``mutation_id`` may be caller-reserved or generated here, but
+    it is not the source event identity. Fingerprint the *full* batch payload:
+    a genuine retry carries the same source id and stays idempotent, while two
+    batches that share graph shape but differ in claim properties, evidence,
+    confidence, or invalidation timestamps get distinct ids. Reuse the canonical
+    ``mutation_batch_to_dict`` serializer so the digest never drifts from the
+    batch schema.
+    """
+    encoded = json.dumps(
+        mutation_batch_to_dict(plan),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    digest = hashlib.blake2b(encoded.encode("utf-8"), digest_size=16).hexdigest()
+    return f"mutation:{digest}"
+
+
+def _build_provenance(
+    plan: MutationBatch,
+    *,
+    pot_id: str,
+    mutation_id: str,
+    context: ProvenanceContext | None,
+    graph_updated_at: datetime,
+) -> ProvenanceRef:
+    ctx = context or ProvenanceContext()
+    # ``event_ref`` is optional now. Non-event writes can still provide a
+    # deterministic source id through ProvenanceContext without fabricating an
+    # EventRef; otherwise fall back to a *stable* content fingerprint so a
+    # retried batch reuses the same source id and stays idempotent (never the
+    # per-apply uuid, which would fabricate a fresh event on every retry).
+    source_event_id = (
+        plan.event_ref.event_id
+        if plan.event_ref
+        else ctx.source_event_id or _stable_batch_source_id(plan)
+    )
+    source_system = (
+        plan.event_ref.source_system if plan.event_ref else ctx.source_system
+    )
+    return ProvenanceRef(
+        pot_id=pot_id,
+        source_event_id=source_event_id,
+        mutation_id=mutation_id,
+        source_system=source_system or None,
+        source_kind=ctx.source_kind,
+        source_ref=ctx.source_ref,
+        event_occurred_at=ctx.event_occurred_at,
+        event_received_at=ctx.event_received_at,
+        graph_updated_at=graph_updated_at,
+        valid_from=ctx.event_occurred_at or graph_updated_at,
+        valid_to=None,
+        confidence=plan.confidence,
+        created_by_agent=ctx.created_by_agent,
+        reconciliation_run_id=ctx.reconciliation_run_id,
+        actor_user_id=ctx.actor_user_id,
+        actor_surface=ctx.actor_surface,
+        actor_client_name=ctx.actor_client_name,
+        actor_auth_method=ctx.actor_auth_method,
+    )
+
+
+async def apply_mutation_batch(
+    graph_writer: GraphWriterPort,
+    plan: MutationBatch,
+    *,
+    expected_pot_id: str,
+    provenance_context: ProvenanceContext | None = None,
+    definition: GraphDefinition = DEFAULT_GRAPH_DEFINITION,
+    reconciliation_config: ReconciliationConfig | None = None,
+) -> MutationResult:
+    """Validate the batch, stamp provenance, and run the four mutation verbs.
+
+    Returns a :class:`MutationResult` carrying the caller-reserved mutation id,
+    or a generated UUID when no reservation was supplied.
+    """
+    graph_updated_at = datetime.now(timezone.utc)
+    validate_mutation_batch(
+        plan,
+        expected_pot_id,
+        definition=definition,
+        config=reconciliation_config,
+        anchor=(
+            provenance_context.prepared.prepared_at
+            if provenance_context and provenance_context.prepared
+            else graph_updated_at
+        ),
+        provenance=provenance_context,
+    )
+
+    mutation_id = (
+        provenance_context.mutation_id
+        if provenance_context is not None and provenance_context.mutation_id
+        else str(uuid4())
+    )
+    prov = _build_provenance(
+        plan,
+        pot_id=expected_pot_id,
+        mutation_id=mutation_id,
+        context=provenance_context,
+        graph_updated_at=graph_updated_at,
+    )
+
+    summary = MutationSummary()
+    try:
+        plan = deepcopy(plan)
+        if plan.edge_upserts or plan.edge_deletes or plan.invalidations:
+            bindings: list[SupersessionBinding] = []
+            read = getattr(graph_writer, "claim_rows", None)
+            if not callable(read):
+                raise TypeError(
+                    "graph writer requires scoped claim_rows for edge mutations"
+                )
+            candidates = candidate_scope(plan)
+            rows = await read(expected_pot_id, **candidates)
+            # Closures validate the complete history of each selected candidate.
+            scopes = set(candidates["history_scopes"])
+            candidate_histories = {
+                (row.subject_key, row.predicate) for row in rows
+            } - scopes
+            histories = (
+                await read(expected_pot_id, history_scopes=candidate_histories)
+                if candidate_histories
+                else []
+            )
+            scopes.update(candidate_histories)
+            seen = {row.record_id for row in rows}
+            rows.extend(row for row in histories if row.record_id not in seen)
+            rows = prepare_claim_closures(
+                plan,
+                rows,
+                anchor=graph_updated_at,
+                bindings=bindings,
+                effective_at=prov.event_occurred_at or prov.valid_from,
+                singleton_predicates=definition.singleton_predicates,
+            )
+            # Invalidation may add system assertions. Fetch their histories
+            # without replacing the virtual post-closure rows already staged.
+            extra_scopes = {
+                (edge.from_entity_key, edge.edge_type) for edge in plan.edge_upserts
+            } - scopes
+            histories = (
+                await read(expected_pot_id, history_scopes=extra_scopes)
+                if extra_scopes
+                else []
+            )
+            seen = {row.record_id for row in rows}
+            rows.extend(row for row in histories if row.record_id not in seen)
+            prepare_assertions_from_rows(
+                plan,
+                rows,
+                pot_id=expected_pot_id,
+                mutation_id=mutation_id,
+                anchor=graph_updated_at,
+                definition=definition,
+                provenance=prov,
+                bindings=bindings,
+            )
+        summary.entity_upserts_applied = await graph_writer.upsert_entities(
+            expected_pot_id, plan.entity_upserts, prov
+        )
+        summary.edge_deletes_applied = await graph_writer.delete_edges(
+            expected_pot_id, plan.edge_deletes, prov
+        )
+        summary.invalidations_applied = await graph_writer.invalidate(
+            expected_pot_id, plan.invalidations, prov
+        )
+        summary.edge_upserts_applied = await graph_writer.upsert_edges(
+            expected_pot_id, plan.edge_upserts, prov
+        )
+    except Exception as exc:
+        raise ReconciliationApplyError(str(exc)) from exc
+
+    return MutationResult(
+        ok=True,
+        mutation_id=mutation_id,
+        mutation_summary=summary,
+        error=None,
+        downgrades=list(plan.ontology_downgrades),
+    )
+
+
+# Back-compat alias (Step 5a rename): callers that still import the old name
+# keep working while new code uses ``apply_mutation_batch``.

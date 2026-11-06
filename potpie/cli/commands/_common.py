@@ -1,0 +1,1910 @@
+"""Shared CLI plumbing for the migrating runtime boundary.
+
+Context-domain commands acquire a typed ``EngineClient``; root-owned commands
+continue to use explicit Potpie services while their callers migrate. This
+module owns the cross-cutting concerns so command bodies stay thin:
+
+- one cached explicit runtime composition and context resource manager per process;
+- ``--json`` output state + ``emit`` / ``fail`` helpers;
+- the ``contract()`` error boundary that maps domain errors to the documented
+  exit codes (0 ok / 1 validation / 2 unavailable / 3 degraded / 4 auth) and the
+  structured JSON error shape (``code``/``message``/``detail``/
+  ``recommended_next_action``);
+- active-pot resolution.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import time
+from contextlib import contextmanager
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Callable, Final, Iterator, Literal, Mapping, NoReturn, Sequence
+
+import click
+import typer
+from potpie_context_engine.core.errors import (
+    CapabilityNotImplemented,
+    ContextEngineDisabled,
+    PotArchived,
+    PotNameConflict,
+    PotNotFound,
+)
+
+from potpie.auth.ports.credentials import CredentialStore
+from potpie.cli.repo_location import (
+    current_git_remote as shared_current_git_remote,
+    normalize_repo_ref as shared_normalize_repo_ref,
+    repo_identity_key,
+)
+from potpie.pots.resolution import (
+    ARCHIVED_POT_NEXT_ACTION,
+    archived_pot_message,
+    is_archived,
+    match_pot_ref,
+)
+
+# --- exit codes (cli-flow.md output contract) -------------------------------
+EXIT_OK = 0
+EXIT_VALIDATION = 1
+EXIT_UNAVAILABLE = 2
+EXIT_DEGRADED = 3
+EXIT_AUTH = 4
+
+
+class CliCancellation(Exception):
+    """Typed CLI-local non-success outcome for cancellation before dispatch."""
+
+    category: Final[str] = "cancellation"
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        message: str,
+        recommended_next_action: str | None = None,
+        exit_code: int = EXIT_VALIDATION,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.recommended_next_action = recommended_next_action
+        self.exit_code = exit_code
+
+
+class CliCancellationExit(typer.Exit):
+    """Process-boundary signal retaining its typed cancellation outcome."""
+
+    def __init__(self, outcome: CliCancellation) -> None:
+        super().__init__(code=outcome.exit_code)
+        self.outcome = outcome
+
+
+class CliExpectedFailureExit(typer.Exit):
+    """Rendered expected failure retaining its stable machine-readable code."""
+
+    def __init__(self, *, error_code: str, exit_code: int) -> None:
+        super().__init__(code=exit_code)
+        self.error_code = error_code
+
+
+def _new_cli_state() -> dict[str, Any]:
+    """Return independent defaults for process-wide CLI state."""
+    return {
+        "json": False,
+        "verbose": False,
+        "runtime": None,
+        "store": None,
+        "json_error_formatter": None,
+        "engine_runner": None,
+        "engine_manager": None,
+        "engine_runtime": None,
+        "engine_daemon_client": None,
+        "engine_daemon_key": None,
+        "pot_service": None,
+        "pot_service_runtime": None,
+        "root_product_services": {},
+        "root_product_services_runtime": None,
+        "root_runtime": None,
+        "root_runtime_source": None,
+        # Pot directories per origin: a test seam (``set_pot_directory_factory``)
+        # and the managed host's directory, kept for the process so its listing
+        # memo spans the whole command.
+        "pot_directory_factory": None,
+        "managed_pots": None,
+    }
+
+
+_state: dict[str, Any] = _new_cli_state()
+_CLI_METRIC_ATTRIBUTE_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "arch",
+        "cli_version",
+        "command",
+        "error_code",
+        "os",
+        "output_mode",
+        "result",
+        "subcommand",
+    }
+)
+
+
+def set_json(value: bool) -> None:
+    _state["json"] = bool(value)
+
+
+def is_json() -> bool:
+    return bool(_state["json"])
+
+
+def bootstrap_output_flags_from_argv(argv: Sequence[str] | None = None) -> None:
+    """Apply ``--json`` / ``--verbose`` before Typer finishes parsing.
+
+    The root callback only runs after a command line parses successfully. Early
+    bootstrap keeps parse-time failures on the documented JSON error contract.
+    """
+    args = tuple(argv or ())
+    scan_args = args
+    if "--" in args:
+        scan_args = args[: args.index("--")]
+    set_json("--json" in scan_args)
+    set_verbose("--verbose" in scan_args or "-v" in scan_args)
+
+
+def set_verbose(value: bool) -> None:
+    _state["verbose"] = bool(value)
+
+
+def is_verbose() -> bool:
+    return bool(_state["verbose"])
+
+
+def get_runtime():
+    """Return the process-wide explicit runtime composition, built lazily."""
+    if _state["runtime"] is None:
+        from potpie.runtime.composition import build_local_runtime
+
+        _state["runtime"] = build_local_runtime()
+    return _state["runtime"]
+
+
+def set_runtime(runtime: Any) -> None:
+    """Inject an explicit runtime composition or focused test double."""
+    _state["runtime"] = runtime
+    _state["engine_manager"] = None
+    _state["engine_runtime"] = None
+    _state["engine_daemon_client"] = None
+    _state["engine_daemon_key"] = None
+    _state["pot_service"] = None
+    _state["pot_service_runtime"] = None
+    _state["root_product_services"] = {}
+    _state["root_product_services_runtime"] = None
+    _state["root_runtime"] = None
+    _state["root_runtime_source"] = None
+    _state["managed_pots"] = None
+
+
+def get_pot_service(runtime: Any | None = None):
+    """Return the finite Potpie-owned pot/source control-plane service."""
+    from potpie.runtime.root_services import build_pot_resource_service
+
+    runtime = runtime if runtime is not None else get_runtime()
+    service = _state.get("pot_service")
+    if service is None or _state.get("pot_service_runtime") is not runtime:
+        service = build_pot_resource_service(runtime)
+        _state["pot_service"] = service
+        _state["pot_service_runtime"] = runtime
+    return service
+
+
+def get_root_runtime():
+    """Return the explicit Potpie-owned product service group."""
+    from potpie.runtime.root_services import build_root_runtime_services
+
+    runtime_source = get_runtime()
+    runtime = _state.get("root_runtime")
+    if runtime is None or _state.get("root_runtime_source") is not runtime_source:
+        runtime = build_root_runtime_services(runtime_source)
+        _state["root_runtime"] = runtime
+        _state["root_runtime_source"] = runtime_source
+    return runtime
+
+
+def _get_root_product_service(
+    name: str,
+    builder: Callable[[Any], object],
+    runtime: Any | None = None,
+):
+    runtime = runtime if runtime is not None else get_root_runtime()
+    if _state.get("root_product_services_runtime") is not runtime:
+        _state["root_product_services"] = {}
+        _state["root_product_services_runtime"] = runtime
+    services = _state["root_product_services"]
+    if name not in services:
+        services[name] = builder(runtime)
+    return services[name]
+
+
+def get_auth_service(runtime: Any | None = None):
+    from potpie.runtime.root_services import build_auth_service
+
+    return _get_root_product_service("auth", build_auth_service, runtime)
+
+
+def get_config_service(runtime: Any | None = None):
+    from potpie.runtime.root_services import build_config_service
+
+    return _get_root_product_service("config", build_config_service, runtime)
+
+
+def get_daemon_service(runtime: Any | None = None):
+    from potpie.runtime.root_services import build_daemon_service
+
+    return _get_root_product_service("daemon", build_daemon_service, runtime)
+
+
+def get_ledger_service(runtime: Any | None = None):
+    from potpie.runtime.root_services import build_ledger_service
+
+    return _get_root_product_service("ledger", build_ledger_service, runtime)
+
+
+def get_setup_service(runtime: Any | None = None):
+    from potpie.runtime.root_services import build_setup_service
+
+    return _get_root_product_service("setup", build_setup_service, runtime)
+
+
+def get_skill_service(runtime: Any | None = None):
+    from potpie.runtime.root_services import build_skill_service
+
+    return _get_root_product_service("skills", build_skill_service, runtime)
+
+
+class EngineClientError(Exception):
+    """Root presentation error carrying one stable typed-boundary failure."""
+
+    def __init__(self, error: object) -> None:
+        super().__init__(str(getattr(error, "message", "Context operation failed.")))
+        self.error = error
+
+
+# --- origins: which host a command talks to ----------------------------------
+#
+# The origin of one invocation is, in order: the prefix of a qualified pot ref
+# (``managed:<ref>``/``local:<ref>``), else ``--host``, else the persisted
+# ``host use`` pointer, which degrades to local while no managed host is
+# configured (``potpie.config.host_registry``). Daemon, skills, setup,
+# integration auth and harness config are machine-local and never consult it.
+
+LOCAL_ORIGIN: Final = "local"
+MANAGED_ORIGIN: Final = "managed"
+
+
+def current_origin() -> str:
+    """The origin this invocation targets right now."""
+    from potpie.config import host_registry
+
+    return host_registry.current_origin()
+
+
+def route_ref(ref: str | None) -> str | None:
+    """Move this invocation to a qualified ref's origin; return the bare ref.
+
+    ``managed:api`` targets the managed host for the rest of the command (not
+    persisted), and the host receives ``api``. A bare ref leaves the origin as
+    it is. Naming a managed host that is not configured is refused rather
+    than answered from the local graph.
+    """
+    if not ref:
+        return ref
+    from potpie.config import host_registry
+
+    origin, bare = host_registry.split_ref(ref)
+    if origin is None or bare is None:
+        return ref
+    _require_usable_origin(origin)
+    host_registry.set_current_origin(origin)
+    return bare
+
+
+def _require_usable_origin(origin: str) -> None:
+    """Refuse targeting a managed host that is not configured (or unusable).
+
+    A ``validation_error`` naming the registry's repair, exactly as ``--host
+    managed`` is refused when no managed host is configured: the host was
+    asked for and there is none to answer, which is never grounds for
+    answering from the local graph.
+    """
+    from potpie.config import host_registry
+
+    if origin == MANAGED_ORIGIN and host_registry.managed_endpoint() is None:
+        message, next_action = host_registry.managed_unconfigured_refusal()
+        fail(code="validation_error", message=message, next_action=next_action)
+
+
+def set_pot_directory_factory(factory: Callable[[str], Any] | None) -> None:
+    """Inject the pot directory per origin (tests / alternate wiring)."""
+    _state["pot_directory_factory"] = factory
+    _state["managed_pots"] = None
+
+
+def _managed_connection():
+    """The managed host's connection, or the registry's refusal when unusable."""
+    from potpie.config import host_registry
+    from potpie.runtime import remote
+
+    try:
+        return remote.connect(host_registry.MANAGED)
+    except remote.HostNotConfigured:
+        raise host_registry.managed_unconfigured_error() from None
+
+
+def pot_directory(origin: str | None = None, *, runtime: Any | None = None):
+    """The :class:`~potpie.pots.directory.PotDirectory` of ``origin``.
+
+    Defaults to the current origin. Local is this machine's in-process pot
+    service; managed is the host's ``host.*`` operations, run on the CLI's
+    event loop so they share the pooled client with engine calls.
+    """
+    origin = origin or current_origin()
+    factory = _state.get("pot_directory_factory")
+    if factory is not None:
+        return factory(origin)
+    if origin == MANAGED_ORIGIN:
+        from potpie.runtime.remote import ManagedPotDirectory
+
+        connection = _managed_connection()
+        cached = _state.get("managed_pots")
+        if cached is None or cached.client is not connection.host:
+            cached = ManagedPotDirectory(
+                connection.host,
+                run=_run_engine_awaitable,
+                repo=_current_remote_repo_key(),
+            )
+            _state["managed_pots"] = cached
+        return cached
+    from potpie.pots.directory import LocalPotDirectory
+
+    return LocalPotDirectory(
+        get_pot_service(runtime),
+        whoami=lambda: get_auth_service().whoami(),
+    )
+
+
+def origin_from_use_flags(*, local: bool, managed: bool) -> str | None:
+    """Map ``--local`` / ``--managed`` to a requested origin, or ``None``.
+
+    Both at once is a refusal rather than a precedence rule: on the flag pair
+    whose whole job is choosing which graph the CLI moves to, honouring one
+    would silently ignore the other.
+    """
+    if local and managed:
+        fail(
+            code="validation_error",
+            message="--local and --managed name different hosts; pass at most one.",
+            next_action="pick one, or qualify the ref (e.g. 'potpie use managed:<name>')",
+        )
+    if local:
+        return LOCAL_ORIGIN
+    if managed:
+        return MANAGED_ORIGIN
+    return None
+
+
+def managed_host_report() -> dict[str, Any]:
+    """The ``host`` row of ``doctor``: which host, and what it says about itself.
+
+    For the managed origin: a handshake (protocol, readiness, operations it
+    serves) and ``daemon.status`` (its version and build). A host that does
+    not answer is reported with the reason, never raised.
+    """
+    from potpie.config import host_registry
+
+    origin = current_origin()
+    report: dict[str, Any] = {
+        "origin": origin,
+        "label": host_registry.origin_label(origin),
+    }
+    if origin != MANAGED_ORIGIN:
+        return report
+    managed = host_registry.managed_host()
+    report.update(
+        {
+            "endpoint": managed.base_url if managed else None,
+            "reachable": False,
+            "instance_id": None,
+            "version": None,
+            "build": None,
+            "protocol": None,
+            "operations": None,
+            "problem": None,
+        }
+    )
+    try:
+        client = _managed_connection().host
+        handshake = _run_engine_awaitable(client.handshake())
+        if not getattr(handshake, "ok", False):
+            report["problem"] = str(getattr(handshake.error, "message", "refused"))
+            return report
+        hello = handshake.value
+        report.update(
+            {
+                "reachable": True,
+                "instance_id": hello.instance_id,
+                "protocol": [hello.protocol_min, hello.protocol_max],
+                "operations": len(hello.capabilities),
+            }
+        )
+        status = _run_engine_awaitable(client.status())
+        if getattr(status, "ok", False):
+            build = status.value.build
+            report["version"] = status.value.version
+            report["build"] = (
+                {"rev": build.rev, "dirty": build.dirty, "built_at": build.built_at}
+                if build is not None
+                else None
+            )
+    except Exception as exc:  # noqa: BLE001 - a diagnostic row never raises
+        report["problem"] = str(exc) or type(exc).__name__
+    return report
+
+
+def _current_remote_repo_key() -> str | None:
+    """The working tree's repo identity, only when it comes from a git remote."""
+    from potpie.pots.directory import is_remote_repo_key
+
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        return None
+    remote = _current_git_remote(cwd)
+    key = repo_identity_key(remote) if remote else None
+    return key if key and is_remote_repo_key(key) else None
+
+
+def _managed_selector(explicit_pot: str | None):
+    """The selector sent to a managed host.
+
+    A repo identity goes to a remote host only when it came from a git
+    remote: a path-derived key would leak a local path and match nothing
+    there, so the host is asked for the caller's active pot instead.
+    """
+    from potpie.runtime import ContextSelector
+
+    if explicit_pot:
+        return ContextSelector(kind="explicit", value=explicit_pot)
+    key = _current_remote_repo_key()
+    if key:
+        return ContextSelector(kind="repository", value=key)
+    return ContextSelector(kind="active")
+
+
+def get_engine_client(explicit_pot: str | None = None, *, runtime: Any | None = None):
+    """The engine client for the current origin: local, daemon or managed.
+
+    A qualified ``explicit_pot`` (``managed:<ref>``) moves the invocation to
+    that origin first. On the managed origin every engine operation goes to
+    the host through ``RemoteEngineClient``; locally the daemon (or, with
+    ``CONTEXT_ENGINE_HOST_MODE=in_process``, this process) serves it.
+    """
+    explicit_pot = route_ref(explicit_pot)
+    if current_origin() == MANAGED_ORIGIN:
+        return _managed_connection().engine(_managed_selector(explicit_pot))
+
+    from potpie.runtime import (
+        DaemonEngineClient,
+        HttpDaemonTransport,
+        LocalEngineClient,
+        ProtocolTransportError,
+    )
+    from potpie.runtime.local_engine import build_local_resource_manager
+
+    selector = _context_selector(explicit_pot)
+    mode = os.getenv("CONTEXT_ENGINE_HOST_MODE", "daemon").strip().lower()
+    if mode != "in_process":
+        from potpie.config.local_paths import (
+            default_home,
+        )
+        from potpie.daemon.discovery import (
+            DaemonDiscoveryError,
+            load_daemon_connection,
+        )
+
+        home = Path(os.getenv("CONTEXT_ENGINE_HOME") or default_home()).resolve()
+        try:
+            connection = load_daemon_connection(home)
+        except DaemonDiscoveryError as exc:
+            raise EngineClientError(
+                ProtocolTransportError(
+                    code="daemon_discovery_unavailable",
+                    message="canonical daemon discovery is unavailable",
+                    recommended_next_action="run 'potpie daemon restart'",
+                    retry_posture="safe",
+                )
+            ) from exc
+        key = (
+            str(home),
+            connection.discovery.instance_id,
+            selector.kind,
+            selector.value,
+        )
+        client = _state.get("engine_daemon_client")
+        if client is None or _state.get("engine_daemon_key") != key:
+            client = DaemonEngineClient(
+                selector=selector,
+                transport=HttpDaemonTransport(
+                    endpoint=connection.discovery.endpoint,
+                    bearer_token=connection.bearer_token,
+                ),
+                expected_instance_id=connection.discovery.instance_id,
+            )
+            handshake = _run_engine_awaitable(client.handshake())
+            if not getattr(handshake, "ok", False):
+                raise EngineClientError(
+                    _actionable_handshake_error(
+                        handshake.error, pid=connection.discovery.pid
+                    )
+                )
+            _state["engine_daemon_client"] = client
+            _state["engine_daemon_key"] = key
+        return client
+
+    runtime = runtime if runtime is not None else get_runtime()
+    from potpie.runtime.composition import LocalRuntimeComposition
+
+    if isinstance(runtime, LocalRuntimeComposition):
+        # This process now serves engine operations itself, so it also drains
+        # pending resource embeddings while it lives (idempotent).
+        runtime.start_background_work()
+    engine_services = (
+        runtime.engine if isinstance(runtime, LocalRuntimeComposition) else runtime
+    )
+    from potpie.runtime.local_engine import LocalGraphMetadataOperationHandler
+
+    context_free_handler = (
+        runtime.graph_metadata
+        if isinstance(runtime, LocalRuntimeComposition)
+        else LocalGraphMetadataOperationHandler(engine_services)
+    )
+    manager = _state.get("engine_manager")
+    if manager is None or _state.get("engine_runtime") is not runtime:
+        manager = build_local_resource_manager(engine_services)
+        _state["engine_manager"] = manager
+        _state["engine_runtime"] = runtime
+        if not isinstance(runtime, LocalRuntimeComposition):
+            from potpie.runtime import OperationCoordinator
+
+            _state["engine_coordinator"] = OperationCoordinator()
+    coordinator = (
+        runtime.coordinator
+        if isinstance(runtime, LocalRuntimeComposition)
+        else _state["engine_coordinator"]
+    )
+    return LocalEngineClient(
+        selector=selector,
+        authentication={"kind": "local_cli"},
+        resource_manager=manager,
+        coordinator=coordinator,
+        context_free_handler=context_free_handler,
+    )
+
+
+def _actionable_handshake_error(error: object, *, pid: int) -> object:
+    """Name the repair when the running daemon is from another Potpie version.
+
+    Each release that adds an operation changes the catalog fingerprint, and a
+    daemon started by the previous install refuses the new CLI's handshake. The
+    daemon's own refusal only says the catalogs differ; say what to do.
+    """
+
+    if getattr(error, "code", None) != "operation_catalog_mismatch":
+        return error
+    try:
+        return replace(
+            error,
+            message=(
+                "The running Potpie daemon was started by a different Potpie "
+                "version and does not serve this version's operations."
+            ),
+            details={**dict(getattr(error, "details", {}) or {}), "pid": pid},
+            recommended_next_action=(
+                "run 'potpie daemon restart'; if the old daemon cannot be "
+                f"stopped, end process {pid} yourself and run 'potpie daemon start'"
+            ),
+        )
+    except TypeError:
+        return error
+
+
+def run_engine_outcome(awaitable):
+    """Run one async engine-client call and return its outcome unraised."""
+    return _run_engine_awaitable(awaitable)
+
+
+def run_engine_operation(awaitable):
+    """Run one async engine-client call and expose typed failures to contract()."""
+    outcome = _run_engine_awaitable(awaitable)
+    if not getattr(outcome, "ok", False):
+        raise EngineClientError(outcome.error)
+    return outcome.value
+
+
+@contextmanager
+def activation_command_outcome(
+    *,
+    command: Literal["resolve", "search", "status"],
+    result_kind: Literal["context_result", "status_result"],
+) -> Iterator[None]:
+    """Capture one controlled terminal outcome for an activation command."""
+
+    from potpie.cli.telemetry.onboarding_events import (
+        capture_activation_command_outcome,
+    )
+
+    started_at = time.perf_counter()
+
+    def capture(
+        outcome: Literal["succeeded", "expected_failed", "cancelled"],
+        *,
+        failure_category: str | None = None,
+    ) -> None:
+        capture_activation_command_outcome(
+            command=command,
+            outcome=outcome,
+            result_kind=result_kind,
+            duration_ms=int(max((time.perf_counter() - started_at) * 1000.0, 0.0)),
+            failure_category=failure_category,
+        )
+
+    try:
+        yield
+    except (CliCancellation, typer.Abort, click.Abort, KeyboardInterrupt, EOFError):
+        capture("cancelled", failure_category="cancellation")
+        raise
+    except CliExpectedFailureExit as exc:
+        capture(
+            "expected_failed",
+            failure_category=_activation_cli_failure_category(exc.error_code),
+        )
+        raise
+    except (
+        EngineClientError,
+        CapabilityNotImplemented,
+        ContextEngineDisabled,
+        PotArchived,
+        PotNameConflict,
+        PotNotFound,
+        ValueError,
+    ) as exc:
+        capture(
+            "expected_failed",
+            failure_category=_activation_failure_category(exc),
+        )
+        raise
+    else:
+        capture("succeeded")
+
+
+def _activation_failure_category(exc: BaseException) -> str:
+    if isinstance(exc, EngineClientError):
+        error = exc.error
+        if str(getattr(error, "code", "")) == "not_implemented":
+            return "not_implemented"
+        category = str(getattr(error, "category", "dependency"))
+        return {
+            "authentication": "authentication",
+            "authorization": "authorization",
+            "dependency": "dependency",
+            "domain": "validation",
+            "engine_lifecycle": "unavailable",
+            "selection": "selection",
+        }.get(category, "dependency")
+    if isinstance(exc, CapabilityNotImplemented):
+        return "not_implemented"
+    if isinstance(exc, ContextEngineDisabled):
+        return "unavailable"
+    if isinstance(exc, (PotArchived, PotNotFound)):
+        return "selection"
+    return "validation"
+
+
+def _activation_cli_failure_category(error_code: str) -> str:
+    if error_code in {
+        "ambiguous_pot",
+        "no_active_pot",
+        "pot_archived",
+        "pot_not_found",
+    }:
+        return "selection"
+    if error_code == "not_implemented":
+        return "not_implemented"
+    if error_code in {"unavailable", "daemon_discovery_unavailable"}:
+        return "unavailable"
+    if "auth" in error_code:
+        return "authentication"
+    return "validation"
+
+
+def confirm_destructive_operation(
+    *,
+    confirmed_by_flag: bool,
+    prompt: str,
+    rerun_command: str,
+):
+    """Bind explicit confirmation before dispatching a destructive operation."""
+
+    from potpie.runtime import DestructiveConfirmation
+
+    if confirmed_by_flag:
+        return DestructiveConfirmation(confirmed=True)
+    if is_json() or not sys.stdin.isatty():
+        fail(
+            code="destructive_confirmation_required",
+            message="Destructive operation requires explicit confirmation.",
+            next_action=f"review the target, then rerun '{rerun_command}'",
+            exit_code=EXIT_VALIDATION,
+        )
+    try:
+        confirmed = typer.confirm(prompt, default=False)
+    except (typer.Abort, EOFError):
+        confirmed = False
+    if not confirmed:
+        cancel(
+            code="destructive_confirmation_declined",
+            message="Destructive operation was not confirmed.",
+            next_action=f"review the target, then rerun '{rerun_command}'",
+            exit_code=EXIT_VALIDATION,
+        )
+    return DestructiveConfirmation(confirmed=True)
+
+
+def _run_engine_awaitable(awaitable):
+    runner = _state.get("engine_runner")
+    if runner is None:
+        runner = asyncio.Runner()
+        _state["engine_runner"] = runner
+    outcome = runner.run(awaitable)
+    return outcome
+
+
+def _context_selector(explicit_pot: str | None):
+    from potpie.runtime import ContextSelector
+
+    if explicit_pot:
+        return ContextSelector(kind="explicit", value=explicit_pot)
+    repo = current_repo_identity_for_cli()
+    if repo:
+        return ContextSelector(kind="repository", value=repo_identity_key(repo))
+    return ContextSelector(kind="active")
+
+
+def get_store() -> CredentialStore:
+    """Return the process-wide ``CredentialStore`` (built lazily).
+
+    The auth/credential subsystem persists through this domain port; the concrete
+    is chosen at the composition root (``potpie.auth.wiring``), so this
+    inbound module never imports an adapter. The default is the real
+    file-backed store; tests inject an in-memory fake via ``set_store``.
+    """
+    if _state["store"] is None:
+        from potpie.auth.wiring import (
+            build_credential_store,
+        )
+
+        _state["store"] = build_credential_store()
+    return _state["store"]
+
+
+def set_store(store: CredentialStore) -> None:
+    """Inject a credential store (tests / alternate wiring)."""
+    _state["store"] = store
+
+
+@contextmanager
+def json_error_formatter(
+    formatter: Callable[[dict[str, Any]], dict[str, Any]] | None,
+) -> Iterator[None]:
+    """Temporarily wrap JSON errors emitted by ``fail``.
+
+    This lets command groups with stricter envelopes, such as ``potpie graph``,
+    reuse the shared error boundary without changing every other CLI command's
+    documented error contract.
+    """
+    old = _state.get("json_error_formatter")
+    _state["json_error_formatter"] = formatter
+    try:
+        yield
+    finally:
+        _state["json_error_formatter"] = old
+
+
+def emit(payload: dict[str, Any], *, human: str) -> None:
+    """Emit a success result: JSON when ``--json``, else a human line."""
+    if is_json():
+        typer.echo(json.dumps(payload, default=str))
+    else:
+        from potpie.cli.ui.format import print_human_block
+
+        print_human_block(human)
+
+
+def fail(
+    *,
+    code: str,
+    message: str,
+    detail: Any = None,
+    next_action: str | None = None,
+    exit_code: int = EXIT_VALIDATION,
+) -> NoReturn:
+    """Emit the structured error contract and exit with the given code."""
+    if is_json():
+        payload = {
+            "code": code,
+            "message": message,
+            "detail": detail,
+            "recommended_next_action": next_action,
+        }
+        formatter = _state.get("json_error_formatter")
+        if callable(formatter):
+            payload = formatter(payload)
+        typer.echo(
+            json.dumps(
+                payload,
+                default=str,
+            )
+        )
+    else:
+        from potpie.cli.ui.format import print_structured_error
+
+        print_structured_error(
+            title=message,
+            message=message,
+            # Structured (mapping) detail is for the JSON envelope; the human
+            # message already carries the guidance in prose.
+            hint=detail if isinstance(detail, str) else None,
+            next_action=next_action,
+        )
+    raise CliExpectedFailureExit(error_code=code, exit_code=exit_code)
+
+
+def cancel(
+    *,
+    code: str,
+    message: str,
+    next_action: str | None = None,
+    exit_code: int = EXIT_VALIDATION,
+) -> NoReturn:
+    """Raise a typed CLI-local cancellation for the command boundary to render."""
+
+    raise CliCancellation(
+        code=code,
+        message=message,
+        recommended_next_action=next_action,
+        exit_code=exit_code,
+    )
+
+
+@contextmanager
+def contract() -> Iterator[None]:
+    """Error boundary: map domain errors to the documented exit codes.
+
+    No command should leak a traceback; an unbuilt capability returns the
+    structured not-implemented contract (exit 2) rather than crashing.
+    """
+    start = time.perf_counter()
+    result = "ok"
+    error_code = "none"
+    try:
+        yield
+    except CliCancellation as exc:
+        result = "cancelled"
+        error_code = "none"
+        from potpie.cli.ui.format import print_human_block
+
+        human = exc.message
+        if exc.recommended_next_action:
+            human = f"{human}\nNext: {exc.recommended_next_action}"
+        print_human_block(human)
+        raise CliCancellationExit(exc) from None
+    except EngineClientError as exc:
+        error_code = _boundary_error_code(exc.error)
+        result = error_code
+        _fail_with_boundary_error(exc.error, fallback=str(exc))
+    except CapabilityNotImplemented as exc:
+        result = "not_implemented"
+        error_code = "not_implemented"
+        fail(
+            code="not_implemented",
+            message=str(exc),
+            detail=exc.detail,
+            next_action=exc.recommended_next_action,
+            exit_code=EXIT_UNAVAILABLE,
+        )
+    except ContextEngineDisabled as exc:
+        result = "unavailable"
+        error_code = "unavailable"
+        fail(
+            code="unavailable",
+            message=str(exc),
+            # Some unavailability has a specific, known repair (e.g. a graph
+            # substrate that shut down uncleanly); prefer it over the generic
+            # pointer at doctor.
+            next_action=getattr(exc, "recommended_next_action", None)
+            or "check backend/daemon readiness with 'potpie doctor'",
+            exit_code=EXIT_UNAVAILABLE,
+        )
+    except PotArchived as exc:
+        # Its own code, not `pot_not_found`: the ref resolved, and sending the
+        # operator to `pot list` for a pot that listing hides on purpose is the
+        # wrong repair.
+        result = "pot_archived"
+        error_code = "pot_archived"
+        fail(
+            code="pot_archived",
+            message=str(exc),
+            next_action=exc.recommended_next_action or ARCHIVED_POT_NEXT_ACTION,
+            exit_code=EXIT_VALIDATION,
+        )
+    except PotNameConflict as exc:
+        result = "pot_name_conflict"
+        error_code = "pot_name_conflict"
+        fail(
+            code="pot_name_conflict",
+            message=str(exc),
+            next_action=exc.recommended_next_action,
+            exit_code=EXIT_VALIDATION,
+        )
+    except PotNotFound as exc:
+        result = "pot_not_found"
+        error_code = "pot_not_found"
+        fail(
+            code="pot_not_found",
+            message=str(exc),
+            next_action="list pots with 'potpie pot list' or create one with 'potpie setup'",
+            exit_code=EXIT_VALIDATION,
+        )
+    except ValueError as exc:
+        result = "validation_error"
+        error_code = "validation_error"
+        # Domain errors may carry structured guidance (e.g. UnknownGraphViewError's
+        # detail.did_you_mean) for the JSON envelope.
+        fail(
+            code="validation_error",
+            message=str(exc),
+            detail=getattr(exc, "detail", None),
+            next_action=getattr(exc, "recommended_next_action", None),
+            exit_code=EXIT_VALIDATION,
+        )
+    except typer.Exit:
+        result = "exit"
+        error_code = "exit"
+        raise
+    except (KeyboardInterrupt, EOFError):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, click.Abort) or type(exc).__name__ == "Abort":
+            raise
+        boundary_error = _remote_host_error(exc)
+        if boundary_error is not None:
+            # A managed host's typed refusal reached through the pot directory:
+            # the same presentation as an engine client's.
+            error_code = _boundary_error_code(boundary_error)
+            result = error_code
+            _fail_with_boundary_error(boundary_error, fallback=str(exc))
+        result = "unexpected"
+        error_code = "unexpected_cli_error"
+        from potpie.cli.telemetry.sentry_runtime import (
+            capture_unexpected_cli_error,
+        )
+
+        capture_unexpected_cli_error(
+            exc,
+            error_code="unexpected_cli_error",
+            error_kind="unexpected",
+        )
+        fail(
+            code="unexpected_cli_error",
+            message="Unexpected internal error.",
+            exit_code=EXIT_VALIDATION,
+        )
+    finally:
+        _record_cli_contract_metrics(
+            started_at=start,
+            result=result,
+            error_code=error_code,
+        )
+
+
+#: What to do about a host older than this client. Kept word for word from the
+#: earlier managed-host client so callers that match on it keep matching.
+HOST_OUTDATED_NEXT_ACTION: Final = (
+    "update that host to this client's Potpie version; until then, everything "
+    "it already supports keeps working (for the local daemon, run 'potpie "
+    "daemon restart')"
+)
+
+
+def _remote_host_error(exc: BaseException) -> object | None:
+    """The typed error inside a ``RemoteHostError``, if ``exc`` is one."""
+    module = sys.modules.get("potpie.runtime.remote")
+    remote_error = getattr(module, "RemoteHostError", None) if module else None
+    if isinstance(remote_error, type) and isinstance(exc, remote_error):
+        return exc.error  # type: ignore[attr-defined]
+    return None
+
+
+def _boundary_error_code(error: object) -> str:
+    code = str(getattr(error, "code", "context_operation_failed"))
+    return "not_implemented" if code == "host_outdated" else code
+
+
+def _fail_with_boundary_error(error: object, *, fallback: str) -> NoReturn:
+    """Render one typed-boundary failure with its documented exit code.
+
+    ``host_outdated`` (a managed host older than this client) is a capability
+    answer, presented as ``not_implemented`` with exit 2: everything else the
+    host supports keeps working.
+    """
+    code = str(getattr(error, "code", "context_operation_failed"))
+    category = str(getattr(error, "category", "dependency"))
+    details = getattr(error, "details", None)
+    message = str(getattr(error, "message", fallback))
+    if code == "host_outdated":
+        operation = (
+            details.get("operation") if isinstance(details, Mapping) else None
+        ) or "operation"
+        fail(
+            code="not_implemented",
+            message=f"Capability not implemented: {operation} — {message}",
+            detail=message,
+            next_action=HOST_OUTDATED_NEXT_ACTION,
+            exit_code=EXIT_UNAVAILABLE,
+        )
+    detail = details.get("detail") if isinstance(details, Mapping) else None
+    if detail is None and details:
+        detail = details
+    if code == "not_implemented":
+        exit_code = EXIT_UNAVAILABLE
+    elif code == "pot_archived":
+        # A lifecycle refusal (the engine's authorizer admits only a graph
+        # reset on an archived pot), not a credential problem: exit 1 like
+        # every other `pot_archived`.
+        exit_code = EXIT_VALIDATION
+    elif category in {"authentication", "authorization"}:
+        exit_code = EXIT_AUTH
+    elif category in {"selection", "domain"}:
+        exit_code = EXIT_VALIDATION
+    else:
+        exit_code = EXIT_UNAVAILABLE
+    fail(
+        code=code,
+        message=message,
+        detail=detail,
+        next_action=getattr(error, "recommended_next_action", None),
+        exit_code=exit_code,
+    )
+
+
+def _record_cli_contract_metrics(
+    *,
+    started_at: float,
+    result: str,
+    error_code: str,
+) -> None:
+    from potpie_context_engine.bootstrap import sentry_metrics_runtime
+
+    attributes = _cli_metric_attributes(result=result, error_code=error_code)
+    duration_ms = max((time.perf_counter() - started_at) * 1000.0, 0.0)
+    # No flush here: the CLI routes these to the telemetry spool, which a
+    # detached flusher ships after the command has already answered.
+    try:
+        sentry_metrics_runtime.count(
+            "ce.cli.invocations_total",
+            attributes=attributes,
+        )
+        sentry_metrics_runtime.distribution(
+            "ce.cli.duration_ms",
+            duration_ms,
+            unit="millisecond",
+            attributes=attributes,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _cli_metric_attributes(
+    *,
+    result: str,
+    error_code: str,
+) -> dict[str, str | int | float | bool]:
+    from potpie.cli.telemetry.context import current_telemetry_context
+
+    telemetry = current_telemetry_context()
+    attributes: dict[str, str | int | float | bool] = {
+        "error_code": error_code,
+        "result": result,
+    }
+    if telemetry is None:
+        return attributes
+    for key, value in telemetry.fields().items():
+        if key in _CLI_METRIC_ATTRIBUTE_KEYS:
+            attributes[key] = value
+    return attributes
+
+
+def resolve_pot_scope(
+    host: Any, explicit: str | None = None, *, infer_from_repo: bool = True
+) -> tuple[str, str]:
+    """Resolve pot id and how it was chosen for CLI scope hints.
+
+    ``resolved_via`` is one of ``explicit``, ``repo_default``, ``linked_repo``, or
+    ``active_pot``. See :func:`resolve_pot_id` for resolution order.
+
+    ``infer_from_repo=False`` skips current-repo inference and goes straight to
+    the active pot. Source registration uses this: ``source add repo .`` is the
+    command that *establishes* the repo→pot mapping, so inferring its target
+    from existing registrations would route the new source to the wrong pot
+    (or fail as ambiguous when other pots already track the same repo).
+    """
+    if explicit:
+        return resolve_pot_ref(host, explicit, hint_prefix="--pot").pot_id, "explicit"
+    pots = _directory(host)
+    repo_identity = _current_repo_identity() if infer_from_repo else None
+    default_pot = _repo_default_pot_id(host, repo_identity)
+    if default_pot:
+        return default_pot, "repo_default"
+    matches = _pots_matching_current_repo(host) if infer_from_repo else []
+    active = pots.active_pot()
+    if len(matches) == 1:
+        return matches[0][0], "linked_repo"
+    if len(matches) > 1:
+        if active is not None and any(active.pot_id == pid for pid, _ in matches):
+            return active.pot_id, "active_pot"
+        names = ", ".join(f"{name} ({pid})" for pid, name in matches)
+        fail(
+            code="ambiguous_pot",
+            message=f"Current repo is registered in multiple pots: {names}.",
+            next_action="pick one with '--pot <id-or-name>' or set it active with 'potpie pot use <id-or-name>'",
+        )
+    if active is None:
+        fail(
+            code="no_active_pot",
+            message="No active pot, and the current repo is not registered as a source in any pot.",
+            next_action="run 'potpie setup', or create a pot with 'potpie pot create <name> --use' and register this repo with 'potpie source add repo .'",
+        )
+    return active.pot_id, "active_pot"
+
+
+def resolve_pot_id(
+    host: Any, explicit: str | None = None, *, infer_from_repo: bool = True
+) -> str:
+    """Resolve ``--pot`` ref → id, else current-repo pot, else active pot."""
+    pot_id, _ = resolve_pot_scope(host, explicit, infer_from_repo=infer_from_repo)
+    return pot_id
+
+
+def _directory(host: Any = None):
+    """The current origin's pot directory (``host`` is the local runtime)."""
+    return pot_directory(runtime=host)
+
+
+def resolve_pot_ref(host: Any, ref: str, *, hint_prefix: str = "--pot") -> Any:
+    """The live pot ``ref`` names, on the origin it targets.
+
+    A qualified ``managed:api`` moves the invocation to that origin first. A
+    bare ref is looked up on the current origin only: pot names are per-host
+    labels, so it never silently resolves on the other host. When it is not
+    found there, the refusal names any pot the other configured origin holds
+    under that ref, with the qualified ref that reaches it.
+    """
+    bare = route_ref(ref) or ref
+    origin = current_origin()
+    live, archived = match_pot_ref(_directory(host).list_pots(), bare)
+    if live is not None:
+        return live
+    if archived is not None:
+        fail(
+            code="pot_archived",
+            message=archived_pot_message(archived),
+            next_action=ARCHIVED_POT_NEXT_ACTION,
+        )
+    message = (
+        f"No pot matching '{bare}' on the {origin} host."
+        if _other_origins(origin)
+        else f"No pot matching '{bare}'."
+    )
+    elsewhere = _matches_on_other_origins(origin, bare)
+    next_action = "run 'potpie pot list'"
+    if elsewhere:
+        qualified = ", ".join(f"'{item}'" for item in elsewhere)
+        message = f"{message} The other host has {qualified}."
+        next_action = (
+            f"target it explicitly, e.g. '{hint_prefix} {elsewhere[0]}', or run "
+            "'potpie pot list --all'"
+        )
+    fail(
+        code="pot_not_found",
+        message=message,
+        detail={"origin": origin, "elsewhere": elsewhere} if elsewhere else None,
+        next_action=next_action,
+    )
+
+
+def _other_origins(origin: str) -> list[str]:
+    """Configured origins other than ``origin`` (diagnostics only)."""
+    from potpie.config import host_registry
+
+    if _state.get("pot_directory_factory") is not None:
+        candidates: tuple[str, ...] = host_registry.ORIGINS
+    else:
+        try:
+            candidates = host_registry.configured_origins()
+        except Exception:  # noqa: BLE001 - optional diagnostics
+            return []
+    return [other for other in candidates if other != origin]
+
+
+def _matches_on_other_origins(origin: str, ref: str) -> list[str]:
+    """``<origin>:<name>`` for each live pot another origin holds under ``ref``.
+
+    Diagnostic enumeration only: it never changes the origin, and a host that
+    cannot be asked is skipped rather than replacing the original refusal.
+    """
+    from potpie.config import host_registry
+
+    found: list[str] = []
+    for other in _other_origins(origin):
+        try:
+            live, _ = match_pot_ref(pot_directory(other).list_pots(), ref)
+        except Exception:  # noqa: BLE001, S112 - optional diagnostics
+            continue
+        if live is not None:
+            found.append(host_registry.qualify(other, live.name))
+    return found
+
+
+def parse_scope_pairs(scope: str | None) -> dict[str, str]:
+    """``key:value[,key:value]`` → dict, refusing anything that is not that.
+
+    One parser for every ``--scope`` flag. A lenient copy on the write path
+    dropped a malformed pair and wrote an unscoped claim at exit 0, so the
+    caller's narrowing silently became no narrowing at all. A scope the CLI
+    cannot read is a refusal, never a smaller filter.
+
+    Raised as ``ValueError`` so the shared ``contract()`` renders it as
+    ``validation_error`` in whichever output mode the caller asked for.
+    """
+    if not scope:
+        return {}
+    out: dict[str, str] = {}
+    for pair in scope.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            raise ValueError(
+                f"invalid --scope entry {pair!r}; expected key:value pairs"
+            )
+        key, value = pair.split(":", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(
+                f"invalid --scope entry {pair!r}; scope keys must not be empty"
+            )
+        value = value.strip()
+        if not value:
+            raise ValueError(
+                f"invalid --scope entry {pair!r}; scope values must not be empty"
+            )
+        out[key] = value
+    return out
+
+
+def require_text(value: str | None, *, argument: str, example: str) -> str:
+    """The trimmed ``value``, refusing one that says nothing.
+
+    An empty or whitespace-only argument is an absent request, not a narrower
+    one: ``potpie search ''`` used to answer with a ranked envelope and a
+    confidence score for a query nobody made.
+    """
+    cleaned = (value or "").strip()
+    if cleaned:
+        return cleaned
+    fail(
+        code="validation_error",
+        message=f"{argument} cannot be empty.",
+        next_action=f"pass a value, e.g. {example}",
+    )
+
+
+def current_repo_identity_for_cli() -> str | None:
+    return _current_repo_identity()
+
+
+def repo_pot_candidates(
+    host: Any, repo: str | None = None, *, include_counts: bool = True
+) -> dict[str, Any]:
+    repo_identity = _repo_identity_from_option(repo)
+    matches = (
+        _pots_matching_current_repo(host)
+        if repo in (None, "", ".", "current")
+        else _pots_matching_repo_identity(host, repo_identity)
+    )
+    default_pot_id = _repo_default_pot_id(host, repo_identity)
+    active = _safe_call(lambda: _directory(host).active_pot(), None)
+    rows: list[dict[str, Any]] = []
+    for pot_id, name in matches:
+        row = {
+            "pot_id": pot_id,
+            "name": name,
+            "active": bool(
+                active is not None and getattr(active, "pot_id", None) == pot_id
+            ),
+            "default": bool(default_pot_id == pot_id),
+            "source_count": pot_source_count(host, pot_id),
+        }
+        if include_counts:
+            row["counts"] = pot_graph_counts(host, pot_id)
+        rows.append(row)
+    return {
+        "repo": repo_identity,
+        "default_pot_id": default_pot_id,
+        "candidates": rows,
+    }
+
+
+def repo_effective_pot_info(host: Any, repo: str | None = None) -> dict[str, Any]:
+    repo_identity = _repo_identity_from_option(repo)
+    matches = (
+        _pots_matching_current_repo(host)
+        if repo in (None, "", ".", "current")
+        else _pots_matching_repo_identity(host, repo_identity)
+    )
+    default_pot_id = _repo_default_pot_id(host, repo_identity)
+    active = _safe_call(lambda: _directory(host).active_pot(), None)
+    active_id = getattr(active, "pot_id", None) if active is not None else None
+    match_ids = {pot_id for pot_id, _ in matches}
+
+    effective_id: str | None = None
+    reason = "unresolved"
+    status = "resolved"
+    if default_pot_id:
+        effective_id = default_pot_id
+        reason = "repo_default"
+    elif len(matches) == 1:
+        effective_id = matches[0][0]
+        reason = "single_linked_repo_pot"
+    elif len(matches) > 1:
+        if active_id and active_id in match_ids:
+            effective_id = str(active_id)
+            reason = "active_linked_repo_pot"
+        else:
+            status = "ambiguous"
+            reason = "multiple_linked_repo_pots"
+    elif active_id:
+        effective_id = str(active_id)
+        reason = "active_pot"
+    else:
+        status = "unresolved"
+        reason = "no_active_pot"
+
+    return {
+        "repo": repo_identity,
+        "active_pot_id": active_id,
+        "default_pot_id": default_pot_id,
+        "effective_pot": _pot_summary(host, effective_id) if effective_id else None,
+        "reason": reason,
+        "status": status,
+        "candidates": [
+            {"id": pot_id, "name": name, "active": bool(active_id == pot_id)}
+            for pot_id, name in matches
+        ],
+    }
+
+
+def repo_effective_pot_human(routing: dict[str, Any]) -> str | None:
+    repo = routing.get("repo")
+    if not repo:
+        return None
+    effective = routing.get("effective_pot")
+    if effective:
+        reason = _ROUTING_REASON_LABELS.get(
+            str(routing.get("reason") or ""), str(routing.get("reason") or "")
+        )
+        return (
+            f"current repo effective pot: {effective.get('name')} "
+            f"({effective.get('id')}) via {reason}"
+        )
+    if routing.get("status") == "ambiguous":
+        names = ", ".join(
+            f"{row.get('name')} ({row.get('id')})"
+            for row in routing.get("candidates", ())
+        )
+        return f"current repo effective pot: ambiguous ({names})"
+    return "current repo effective pot: (unresolved)"
+
+
+def repo_default_mismatch_warning(
+    host: Any, routing: dict[str, Any], *, selected_pot_id: str
+) -> str | None:
+    default_id = routing.get("default_pot_id")
+    repo = routing.get("repo")
+    if not default_id or default_id == selected_pot_id or not repo:
+        return None
+    default = _pot_summary(host, str(default_id))
+    return (
+        f"repo {repo} default remains {default.get('name')} ({default_id}); "
+        "repo-scoped commands here use that pot. Run "
+        f"`potpie pot default set --repo current {selected_pot_id}` "
+        "or retry with `--also-default-for-current-repo` to switch both."
+    )
+
+
+def pot_scope_info(host: Any, pot_id: str) -> dict[str, Any]:
+    pot = _pot_for_id(host, pot_id)
+    return {
+        "id": pot_id,
+        "name": getattr(pot, "name", pot_id) if pot is not None else pot_id,
+        "active": bool(getattr(pot, "active", False)) if pot is not None else False,
+        "source_count": pot_source_count(host, pot_id),
+        "counts": pot_graph_counts(host, pot_id),
+    }
+
+
+def pot_scope_resolution_human(resolved_via: str, *, repo: str | None = None) -> str:
+    if resolved_via == "explicit":
+        return "via --pot"
+    if resolved_via == "repo_default":
+        return f"via repo default for {repo}" if repo else "via repo default"
+    if resolved_via == "linked_repo":
+        return f"via linked repo {repo}" if repo else "via linked repo"
+    return "via active pot"
+
+
+def pot_scope_human(
+    host: Any,
+    pot_id: str,
+    *,
+    resolved_via: str | None = None,
+    repo: str | None = None,
+) -> str:
+    info = pot_scope_info(host, pot_id)
+    counts = info.get("counts") or {}
+    claims = counts.get("claims", 0)
+    entities = counts.get("entities", 0)
+    scope = (
+        f"pot={info.get('name')} ({pot_id}) "
+        f"sources={info.get('source_count', 0)} claims={claims} entities={entities}"
+    )
+    if resolved_via:
+        scope += f" {pot_scope_resolution_human(resolved_via, repo=repo)}"
+    return scope
+
+
+def _known_claims_count(counts: dict[str, int]) -> int | None:
+    if "claims" not in counts:
+        return None
+    return int(counts["claims"])
+
+
+def _pot_claims_count(host: Any, pot_id: str) -> int | None:
+    return _known_claims_count(pot_graph_counts(host, pot_id))
+
+
+def empty_pot_warnings(
+    host: Any, pot_id: str, repo: str | None = None
+) -> tuple[str, ...]:
+    claims = _pot_claims_count(host, pot_id)
+    if claims is None or claims != 0:
+        return ()
+    linked = repo_pot_candidates(host, repo)
+    alternatives = [
+        row
+        for row in linked.get("candidates", ())
+        if row.get("pot_id") != pot_id
+        and (alt_claims := _known_claims_count(row.get("counts") or {})) is not None
+        and alt_claims > 0
+    ]
+    if not alternatives:
+        return ()
+    best = sorted(
+        alternatives,
+        key=lambda row: _known_claims_count(row.get("counts") or {}) or 0,
+        reverse=True,
+    )[0]
+    claims = _known_claims_count(best.get("counts") or {}) or 0
+    return (
+        (
+            f"current pot has 0 claims; repo {linked.get('repo')} also links to "
+            f"{best.get('name')} ({best.get('pot_id')}) with {claims} claims. "
+            f"Retry with --pot {best.get('pot_id')} or run "
+            f"`potpie pot default set --repo current {best.get('pot_id')}`."
+        ),
+    )
+
+
+def empty_pot_guidance(
+    host: Any, pot_id: str, repo: str | None = None
+) -> tuple[str, ...]:
+    """Recovery hints when a pot has no graph claims yet."""
+    warnings = list(empty_pot_warnings(host, pot_id, repo))
+    claims = _pot_claims_count(host, pot_id)
+    if claims is None or claims != 0:
+        return tuple(warnings)
+    if pot_source_count(host, pot_id) > 0:
+        warnings.append(
+            "pot has registered sources but 0 claims; next: run harness-led ingestion "
+            "(agent skills + `potpie graph propose/commit`), switch with "
+            "`potpie pot use <id>` or inspect `potpie pot linked --repo current`, "
+            "or keep this empty pot intentionally."
+        )
+    elif not warnings:
+        warnings.append(
+            "pot has 0 claims and no sources; next: `potpie source add repo .` "
+            "then harness-led ingestion, or keep this empty pot intentionally."
+        )
+    return tuple(warnings)
+
+
+def enrich_with_pot_guidance(
+    host: Any,
+    pot_id: str,
+    payload: dict[str, Any],
+    *,
+    human: str,
+    repo: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    warnings = empty_pot_guidance(host, pot_id, repo)
+    existing = payload.get("warnings") or []
+    existing_warnings = [existing] if isinstance(existing, str) else list(existing)
+    combined_warnings = [*existing_warnings, *warnings]
+    if not combined_warnings:
+        return payload, human
+    human_lines = [human, *(f"! {warning}" for warning in warnings)]
+    return (
+        {
+            **payload,
+            "warnings": combined_warnings,
+            "recommended_next_action": payload.get("recommended_next_action")
+            or combined_warnings[0],
+        },
+        "\n".join(human_lines),
+    )
+
+
+def use_pot_selection(
+    host: Any,
+    ref: str,
+    *,
+    also_default_for_current_repo: bool = False,
+    origin: str | None = None,
+    hint_prefix: str = "potpie pot use",
+) -> tuple[dict[str, Any], str]:
+    """Select the active pot on the host that owns it, then persist that host.
+
+    ``origin`` is a *request* (``use --local``/``--managed``), equivalent to
+    qualifying the ref; the two contradicting each other is refused. The pot
+    is selected on exactly that origin (a bare ref: the current origin) and
+    never on the other one. With ``also_default_for_current_repo`` the repo
+    default is bound on the same host once the selection succeeded, and only
+    then is ``active_origin`` persisted, so a refused step never strands the
+    CLI on a host nobody chose.
+    """
+    from potpie.config import host_registry
+
+    qualifier, bare = host_registry.split_ref(ref)
+    if qualifier is not None and bare is not None:
+        if origin is not None and origin != qualifier:
+            fail(
+                code="validation_error",
+                message=(
+                    f"--{origin} contradicts the ref '{ref}', which targets the "
+                    f"{qualifier} host."
+                ),
+                next_action=(
+                    f"drop --{origin}, or pass '{host_registry.qualify(origin, bare)}'"
+                ),
+            )
+        origin, ref = qualifier, bare
+    target = origin or current_origin()
+    _require_usable_origin(target)
+    host_registry.set_current_origin(target)
+
+    repo_key = None
+    if also_default_for_current_repo:
+        repo_key = current_repo_identity_for_cli()
+        if not repo_key:
+            raise ValueError("--also-default-for-current-repo requires a repo")
+        if target == MANAGED_ORIGIN:
+            from potpie.pots.directory import is_remote_repo_key
+
+            if not is_remote_repo_key(repo_key):
+                raise ValueError(
+                    "--also-default-for-current-repo on a managed host needs a "
+                    "repository with a git remote ('origin'); this working tree "
+                    "has none"
+                )
+
+    pots = _directory(host)
+    # Resolved here first so a miss is reported against this host, naming
+    # any pot the other host holds under the same ref.
+    live, archived = match_pot_ref(pots.list_pots(), ref)
+    if live is None and archived is None:
+        resolve_pot_ref(host, ref, hint_prefix=hint_prefix)
+    pot = pots.use_pot(ref=ref)
+    repo_default_set = False
+    if repo_key:
+        pots.set_repo_default(repo=repo_key, pot_id=pot.pot_id)
+        repo_default_set = True
+    if host_registry.persisted_origin() != target:
+        host_registry.set_persisted_origin(target)
+
+    routing = repo_effective_pot_info(host)
+    warnings = []
+    warning = repo_default_mismatch_warning(host, routing, selected_pot_id=pot.pot_id)
+    if warning:
+        warnings.append(warning)
+
+    lines = [f"active pot → {pot.name} ({target})"]
+    if repo_default_set:
+        lines.append(f"repo {repo_key} default → {pot.name} ({pot.pot_id})")
+    lines.extend(f"warning: {item}" for item in warnings)
+
+    payload: dict[str, Any] = {
+        "id": pot.pot_id,
+        "name": pot.name,
+        "origin": target,
+        "repo_default_set": repo_default_set,
+        "current_repo": routing,
+        "warnings": warnings,
+    }
+
+    return enrich_with_pot_guidance(
+        host,
+        pot.pot_id,
+        payload,
+        human="\n".join(lines),
+        repo=repo_key,
+    )
+
+
+def pot_graph_counts(host: Any, pot_id: str) -> dict[str, int]:
+    from potpie_context_engine.requests import DataPlaneStatusRequest
+
+    status = _safe_call(
+        lambda: run_engine_operation(
+            get_engine_client(pot_id).data_plane_status(DataPlaneStatusRequest())
+        ),
+        None,
+    )
+    if status is None:
+        return {}
+    counts = getattr(status, "counts", {}) or {}
+    out: dict[str, int] = {}
+    for key, value in dict(counts).items():
+        try:
+            out[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def pot_source_count(host: Any, pot_id: str) -> int:
+    return len(
+        _safe_call(lambda: _directory(host).list_sources(pot_id=pot_id), []) or []
+    )
+
+
+def _repo_identity_from_option(repo: str | None) -> str | None:
+    return (
+        _current_repo_identity()
+        if repo in (None, "", ".", "current")
+        else repo_identity_key(repo or "")
+    )
+
+
+def _pot_summary(host: Any, pot_id: str | None) -> dict[str, Any] | None:
+    if not pot_id:
+        return None
+    pot = _pot_for_id(host, pot_id)
+    return {
+        "id": pot_id,
+        "name": getattr(pot, "name", pot_id) if pot is not None else pot_id,
+        "active": bool(getattr(pot, "active", False)) if pot is not None else False,
+    }
+
+
+def _pots_matching_current_repo(host: Any) -> list[tuple[str, str]]:
+    """Return ``(pot_id, name)`` for every pot whose repo source matches cwd.
+
+    A pot is the project boundary, not a single repository. This helper only
+    chooses the pot from the current working tree; it does not inject a repo
+    scope into reads. Timeline queries therefore default to the whole project
+    across all repositories attached to the pot. The caller decides how to
+    disambiguate multiple matches (active pot wins; otherwise a structured
+    ``ambiguous_pot`` error).
+    """
+
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        return []
+    remote = _current_git_remote(cwd)
+    return _pots_matching_repo_source(
+        host, lambda ref: _repo_source_matches_cwd(ref, cwd=cwd, remote=remote)
+    )
+
+
+def _pots_matching_repo_identity(
+    host: Any, repo_identity: str | None
+) -> list[tuple[str, str]]:
+    if not repo_identity:
+        return []
+    return _pots_matching_repo_source(
+        host, lambda ref: repo_identity_key(ref) == repo_identity
+    )
+
+
+def _pots_matching_repo_source(
+    host: Any, matches_ref: Callable[[str], bool]
+) -> list[tuple[str, str]]:
+    """``(pot_id, name)`` for each live pot with a repo source ``matches_ref`` accepts.
+
+    Reads the repo→pot index in one control-plane call rather than asking each
+    pot for its sources. Matching stays here: whether a registered parent
+    directory contains the cwd, or which remote the tree has, is a client-side
+    fact. One entry per pot, in pot order, as the per-pot walk produced.
+    """
+    index = _safe_call(lambda: _directory(host).list_repo_sources(), [])
+    matches: list[tuple[str, str]] = []
+    matched: set[str] = set()
+    for row in index or ():
+        pot_id = str(getattr(row, "pot_id", "") or "")
+        if not pot_id or pot_id in matched:
+            continue
+        refs = (
+            str(getattr(row, "name", "") or "").strip(),
+            str(getattr(row, "location", "") or "").strip(),
+        )
+        if any(matches_ref(ref) for ref in dict.fromkeys(refs) if ref):
+            matches.append((pot_id, str(getattr(row, "pot_name", "") or pot_id)))
+            matched.add(pot_id)
+    return matches
+
+
+def _current_repo_identity() -> str | None:
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        return None
+    return _current_git_remote(cwd) or str(cwd)
+
+
+def repo_default_pot_id(host: Any, repo_identity: str | None) -> str | None:
+    """Return the locally persisted default pot id for a repo identity, if valid."""
+    if not repo_identity:
+        return None
+    getter = getattr(_directory(host), "repo_default", None)
+    if not callable(getter):
+        return None
+    pot_id = _safe_call(lambda: getter(repo=repo_identity), None)
+    if not pot_id:
+        return None
+    pot_id = str(pot_id)
+    pot = _pot_for_id(host, pot_id)
+    # A pointer at a pot that is gone or archived is stale, not authoritative:
+    # an archived pot's graph state was cleared, so routing there answers empty.
+    if pot is None or is_archived(pot):
+        return None
+    return pot_id
+
+
+def repo_default_matches(host: Any, repo_key: str | None, pot_id: str) -> bool:
+    """True when ``repo_key``'s repo default is set to ``pot_id``."""
+    default_pot = repo_default_pot_id(host, repo_key)
+    return bool(default_pot and default_pot == pot_id)
+
+
+def _repo_default_pot_id(host: Any, repo_identity: str | None) -> str | None:
+    return repo_default_pot_id(host, repo_identity)
+
+
+def _pot_for_id(host: Any, pot_id: str):
+    for pot in _safe_call(lambda: _directory(host).list_pots(), []) or []:
+        if getattr(pot, "pot_id", None) == pot_id:
+            return pot
+    return None
+
+
+def _safe_call(fn, default):
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _repo_source_matches_cwd(
+    source_name: str, *, cwd: Path, remote: str | None
+) -> bool:
+    if not source_name:
+        return False
+    source_path = Path(source_name).expanduser()
+    if source_path.is_absolute() or source_name.startswith((".", "~")):
+        try:
+            resolved = source_path.resolve(strict=False)
+        except OSError:
+            resolved = source_path.absolute()
+        if (
+            cwd == resolved
+            or cwd.is_relative_to(resolved)
+            or resolved.is_relative_to(cwd)
+        ):
+            return True
+
+    normalized_source = _normalize_repo_ref(source_name)
+    return bool(remote and normalized_source and normalized_source == remote)
+
+
+def _current_git_remote(cwd: Path) -> str | None:
+    return shared_current_git_remote(cwd)
+
+
+def _normalize_repo_ref(value: str) -> str | None:
+    return shared_normalize_repo_ref(value)
+
+
+_ROUTING_REASON_LABELS: Final[dict[str, str]] = {
+    "repo_default": "repo default",
+    "single_linked_repo_pot": "single linked repo pot",
+    "active_linked_repo_pot": "active linked repo pot",
+    "active_pot": "active pot",
+}
+
+
+__all__ = [
+    "EXIT_AUTH",
+    "EXIT_DEGRADED",
+    "EXIT_OK",
+    "EXIT_UNAVAILABLE",
+    "EXIT_VALIDATION",
+    "activation_command_outcome",
+    "bootstrap_output_flags_from_argv",
+    "confirm_destructive_operation",
+    "contract",
+    "emit",
+    "fail",
+    "get_runtime",
+    "get_store",
+    "current_repo_identity_for_cli",
+    "empty_pot_guidance",
+    "empty_pot_warnings",
+    "enrich_with_pot_guidance",
+    "is_json",
+    "is_verbose",
+    "parse_scope_pairs",
+    "pot_graph_counts",
+    "pot_scope_human",
+    "pot_scope_info",
+    "pot_scope_resolution_human",
+    "pot_source_count",
+    "repo_default_matches",
+    "repo_default_mismatch_warning",
+    "repo_default_pot_id",
+    "repo_effective_pot_human",
+    "repo_effective_pot_info",
+    "repo_pot_candidates",
+    "require_text",
+    "resolve_pot_id",
+    "resolve_pot_scope",
+    "set_runtime",
+    "set_store",
+    "set_json",
+    "set_verbose",
+    "use_pot_selection",
+]

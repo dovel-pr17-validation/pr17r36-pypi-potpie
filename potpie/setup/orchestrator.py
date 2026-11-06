@@ -1,0 +1,471 @@
+"""``DefaultSetupOrchestrator`` — the one first-run sequence.
+
+Calls the bespoke per-component lifecycle methods in dependency order and folds
+each outcome into a ``SetupReport``. Each step is wrapped so an unbuilt body
+(``CapabilityNotImplemented``) becomes a ``not_implemented`` ``StepResult`` and
+any other error becomes ``failed`` — setup runs what is ready and reports the
+rest, never crashing. **Hard** steps gate ``SetupReport.ok``; **soft** steps do
+not. See docs/context-graph/architecture.md "Component Lifecycle & Setup".
+
+One ``_SEAM_PLAN`` table is the single source of truth for the ordered steps,
+their owners, and their actions; ``preview`` (dry-run) and ``run`` both derive
+from it, and hardness is derived from
+``plan.host_mode`` so the daemon/installer steps are hard for a detached daemon
+and skipped for an in-process host.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+from potpie_context_engine.core.errors import CapabilityNotImplemented
+from potpie_context_engine.domain.embedding_modes import (
+    EMBEDDING_MODEL_PREP_SKIPPED_ALIASES,
+    SEMANTIC_EMBEDDER_ALIASES,
+    SEMANTIC_EMBEDDINGS_INSTALL_HINT,
+    normalize_embedding_mode,
+)
+from potpie_context_engine.domain.git_probe import current_git_remote
+from potpie_context_engine.core.repository_identity import repo_identity_key
+from potpie_context_engine.core.lifecycle import (
+    DONE,
+    FAILED,
+    NOT_IMPLEMENTED,
+    SKIPPED,
+    PlannedSetupStep,
+    SetupPlan,
+    SetupPreview,
+    SetupReport,
+    StepResult,
+)
+from potpie.setup.installation import Installer
+from potpie_context_engine.domain.ports.provisioning import ProvisionableGraphBackend
+from potpie.auth.ports.identity import AuthService
+from potpie.config.contracts import ConfigService
+from potpie.pots.contracts import (
+    PotManagementService,
+)
+from potpie.skills.contracts import SkillManager
+from potpie.setup.state import (
+    MigrationPort,
+    StateStorePort,
+)
+from potpie.setup.contracts import (
+    NoOpSetupObserver,
+    SetupObserver,
+)
+from potpie.daemon.lifecycle import Daemon
+
+# Dependency-ordered seam plan: (step, owner, action template). Mirrors the
+# architecture.md "Seam → owner map"; the orchestrator depends only on each
+# owner's method signature.
+_SEAM_PLAN: tuple[tuple[str, str, str], ...] = (
+    (
+        "config",
+        "config / workspace",
+        "ensure home + write config.json (profile={mode})",
+    ),
+    (
+        "installer",
+        "installer / packaging",
+        "ensure CLI on PATH + register service unit",
+    ),
+    (
+        "embeddings.model",
+        "intelligence / embeddings",
+        "prepare {embeddings} model '{embedding_model}'",
+    ),
+    ("backend.provision", "graph backend", "provision '{backend}' store"),
+    ("pot.init", "pot management", "init control-plane state store (mode={mode})"),
+    (
+        "state_store.provision",
+        "relational state store",
+        "provision relational state store",
+    ),
+    ("migrator.migrate", "migrations", "run schema migrations"),
+    ("pot.default", "pot management", "create + activate pot '{pot}'"),
+    ("daemon", "daemon / host", "ensure host running"),
+    ("auth", "auth", "init local auth"),
+    ("source", "pot management", "register repo '{repo}'"),
+    ("skills", "skill manager", "install skills for '{agent}'"),
+)
+
+# Soft steps never gate the run. Host-gated steps are hard only for a detached
+# daemon host; an in-process host skips them.
+_SOFT_STEPS = frozenset({"auth", "source", "skills", "embeddings.model"})
+_HOST_GATED = frozenset({"installer", "daemon"})
+
+
+def _is_hard(step: str, host_mode: str) -> bool:
+    if step in _SOFT_STEPS:
+        return False
+    if step in _HOST_GATED:
+        return host_mode == "daemon"
+    return True
+
+
+def _skip_reason(step: str, plan: SetupPlan) -> str | None:
+    if step in _HOST_GATED and plan.host_mode != "daemon":
+        return "in-process host — no detached daemon / service unit to manage"
+    if step == "source" and not plan.repo:
+        return "no --repo provided"
+    if step == "source" and plan.defer_default_pot:
+        return "deferred until post-setup first pot"
+    if step == "pot.default" and plan.defer_default_pot:
+        return "named in post-setup wizard"
+    if step == "skills" and plan.defer_skills:
+        return "chosen in post-setup wizard"
+    if (
+        step == "embeddings.model"
+        and normalize_embedding_mode(plan.embeddings)
+        in EMBEDDING_MODEL_PREP_SKIPPED_ALIASES
+    ):
+        return f"embedding mode is {plan.embeddings}"
+    return None
+
+
+def _planned_steps(plan: SetupPlan) -> list[PlannedSetupStep]:
+    """The ordered dry-run steps for ``plan``."""
+    steps: list[PlannedSetupStep] = []
+    for step, owner, action_tmpl in _SEAM_PLAN:
+        if step == "pot.default" and plan.defer_default_pot:
+            continue
+        if step == "skills" and plan.defer_skills:
+            continue
+        steps.append(
+            PlannedSetupStep(
+                step=step,
+                hard=_is_hard(step, plan.host_mode),
+                owner=owner,
+                action=action_tmpl.format(
+                    mode=plan.mode,
+                    backend=plan.backend,
+                    pot=plan.pot,
+                    agent=plan.agent,
+                    repo=plan.repo,
+                    embeddings=plan.embeddings,
+                    embedding_model=plan.embedding_model,
+                ),
+                skip_reason=_skip_reason(step, plan),
+            )
+        )
+    return steps
+
+
+@dataclass(slots=True)
+class DefaultSetupOrchestrator:
+    """Sequences config → installer → backend → pot.init → state store → migrate
+    → default pot → daemon → auth → source → skills over the bespoke
+    per-component methods."""
+
+    config: ConfigService
+    installer: Installer
+    backend: ProvisionableGraphBackend
+    pots: PotManagementService
+    state_store: StateStorePort
+    migrator: MigrationPort
+    daemon: Daemon
+    auth: AuthService
+    skills: SkillManager
+    observer: SetupObserver = field(default_factory=NoOpSetupObserver)
+
+    def set_observer(self, observer: SetupObserver) -> None:
+        self.observer = observer
+
+    def preview(self, plan: SetupPlan) -> SetupPreview:
+        """Dry-run: the ordered steps ``run`` would execute, unexecuted."""
+        return SetupPreview(
+            plan=plan, steps=tuple(_planned_steps(plan)), ok_to_run=True
+        )
+
+    def run(self, plan: SetupPlan) -> SetupReport:
+        def hard(step: str) -> bool:
+            return _is_hard(step, plan.host_mode)
+
+        steps: list[StepResult] = [
+            self._step("config", hard("config"), lambda: self._config(plan)),
+            self._step("installer", hard("installer"), self._installer),
+            self._step(
+                "embeddings.model",
+                hard("embeddings.model"),
+                lambda: self._embedding_model(plan),
+            ),
+            self._step(
+                "backend.provision",
+                hard("backend.provision"),
+                self._backend,
+            ),
+            self._step(
+                "pot.init",
+                hard("pot.init"),
+                lambda: self.pots.init(mode=plan.mode, backend=plan.backend),
+            ),
+            self._step(
+                "state_store.provision",
+                hard("state_store.provision"),
+                self.state_store.provision,
+            ),
+            self._step(
+                "migrator.migrate", hard("migrator.migrate"), self.migrator.migrate
+            ),
+            *(
+                [
+                    self._step(
+                        "pot.default",
+                        hard("pot.default"),
+                        lambda: self._default_pot(plan),
+                    )
+                ]
+                if not plan.defer_default_pot
+                else []
+            ),
+            self._step("daemon", hard("daemon"), lambda: self.daemon.ensure(plan)),
+            self._step("auth", hard("auth"), self.auth.init_local),
+            self._step("source", hard("source"), lambda: self._source(plan)),
+            *(
+                [self._step("skills", hard("skills"), lambda: self._skills(plan))]
+                if not plan.defer_skills
+                else []
+            ),
+        ]
+        return SetupReport(plan=plan, steps=tuple(steps))
+
+    # --- step runner --------------------------------------------------------
+    def _step(self, name: str, hard: bool, fn: Callable[[], object]) -> StepResult:
+        self._notify_step_started(step=name, hard=hard)
+        started = time.perf_counter()
+        try:
+            result = fn()
+            if isinstance(result, StepResult):
+                # Preserve the component's own state/detail; enforce this step's name + hard flag.
+                step_result = StepResult(
+                    name,
+                    result.state,
+                    result.detail,
+                    hard=hard,
+                    metadata=result.metadata,
+                )
+            else:
+                step_result = StepResult(name, DONE, _describe(result), hard=hard)
+        except CapabilityNotImplemented as exc:
+            step_result = StepResult(
+                name, NOT_IMPLEMENTED, exc.detail or str(exc), hard=hard
+            )
+        except Exception as exc:  # never let one component crash the whole run
+            step_result = StepResult(name, FAILED, str(exc), hard=hard)
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        self._notify_step_completed(result=step_result, duration_ms=duration_ms)
+        return step_result
+
+    def _notify_step_started(self, *, step: str, hard: bool) -> None:
+        try:
+            self.observer.step_started(step=step, hard=hard)
+        except Exception:  # noqa: BLE001 - setup analytics must not affect setup.
+            return
+
+    def _notify_step_completed(self, *, result: StepResult, duration_ms: int) -> None:
+        try:
+            self.observer.step_completed(result=result, duration_ms=duration_ms)
+        except Exception:  # noqa: BLE001 - setup analytics must not affect setup.
+            return
+
+    # --- step bodies --------------------------------------------------------
+    def _config(self, plan: SetupPlan) -> str:
+        self.config.ensure_home()
+        path = self.config.write_defaults(plan)
+        return f"config at {path}"
+
+    def _installer(self) -> StepResult:
+        if self.installer.is_installed():
+            return StepResult("installer", SKIPPED, "CLI already available")
+        self.installer.install_cli()
+        self.installer.register_service()
+        return StepResult("installer", DONE, "CLI installed + service registered")
+
+    def _backend(self) -> StepResult:
+        result = self.backend.provision()
+        return StepResult(
+            "backend.provision",
+            DONE if result.ok else FAILED,
+            result.detail,
+            metadata=result.metadata,
+        )
+
+    def _default_pot(self, plan: SetupPlan) -> str:
+        pot = self.pots.create_pot(name=plan.pot, use=True)
+        return f"active pot '{pot.name}' ({pot.pot_id})"
+
+    def _embedding_model(self, plan: SetupPlan) -> StepResult:
+        mode = normalize_embedding_mode(plan.embeddings)
+        if mode in EMBEDDING_MODEL_PREP_SKIPPED_ALIASES:
+            return StepResult(
+                "embeddings.model",
+                SKIPPED,
+                f"embedding mode is {plan.embeddings}",
+                metadata={"mode": plan.embeddings},
+            )
+        embedder = getattr(self.backend, "embedder", None)
+        prepare = getattr(embedder, "prepare", None)
+        if embedder is None or not callable(prepare):
+            if mode in SEMANTIC_EMBEDDER_ALIASES and (
+                getattr(embedder, "name", None) == "local-hashing-v1"
+            ):
+                return StepResult(
+                    "embeddings.model",
+                    FAILED,
+                    "sentence-transformers is unavailable; using local-hashing-v1 "
+                    f"— {SEMANTIC_EMBEDDINGS_INSTALL_HINT}",
+                    metadata={
+                        "mode": plan.embeddings,
+                        "model": plan.embedding_model,
+                        "fallback": "local-hashing-v1",
+                    },
+                )
+            return StepResult(
+                "embeddings.model",
+                SKIPPED,
+                "embedding model is not configurable for this backend",
+                metadata={"mode": plan.embeddings},
+            )
+        try:
+            metadata = prepare()
+        except Exception as exc:  # noqa: BLE001 - setup should keep moving offline.
+            return StepResult(
+                "embeddings.model",
+                FAILED,
+                f"{plan.embedding_model} was not prepared: {exc}",
+                metadata={"mode": plan.embeddings, "model": plan.embedding_model},
+            )
+        if not isinstance(metadata, dict):
+            metadata = {}
+        model = metadata.get("model") or plan.embedding_model
+        cache = metadata.get("cache_folder")
+        detail = f"{model} ready"
+        if cache:
+            detail = f"{detail} in {cache}"
+        return StepResult(
+            "embeddings.model",
+            DONE,
+            detail,
+            metadata={**metadata, "mode": plan.embeddings, "model": model},
+        )
+
+    def _source(self, plan: SetupPlan) -> StepResult:
+        if not plan.repo:
+            return StepResult("source", SKIPPED, "no --repo provided")
+        if plan.defer_default_pot:
+            return StepResult("source", SKIPPED, "deferred until post-setup first pot")
+        active = self.pots.active_pot()
+        if active is None:
+            return StepResult("source", SKIPPED, "no active pot")
+        # Resolve first, then match on the repo identity key: the raw flag
+        # (``--repo .``) never equals the stored resolved location, so comparing
+        # the two appended another source on every re-run, and the same repo
+        # spelled two ways must stay one row.
+        location = _resolve_setup_repo_location(plan.repo)
+        repo_key = repo_identity_key(location)
+        existing = _matching_repo_source(
+            self.pots.list_sources(pot_id=active.pot_id), repo_key=repo_key
+        )
+        if existing is not None:
+            self._converge_repo_default(location=location, pot_id=active.pot_id)
+            return StepResult(
+                "source",
+                SKIPPED,
+                f"repo '{location}' already registered ({existing.source_id})",
+                metadata={
+                    "source_id": existing.source_id,
+                    "location": location,
+                    "repo_key": repo_key,
+                    "already_registered": True,
+                },
+            )
+        source = self.pots.add_source(
+            pot_id=active.pot_id, kind="repo", location=location
+        )
+        self.pots.set_repo_default(repo=location, pot_id=active.pot_id)
+        return StepResult(
+            "source",
+            DONE,
+            f"registered repo '{location}'",
+            metadata={
+                "source_id": getattr(source, "source_id", None),
+                "location": location,
+                "repo_key": repo_key,
+                "already_registered": False,
+            },
+        )
+
+    def _converge_repo_default(self, *, location: str, pot_id: str) -> None:
+        """Bind the repo to this pot only if nothing usable is bound already.
+
+        A run that registers the source owns the routing decision. A re-run that
+        finds the source already there must not undo a deliberate ``potpie pot
+        default set``: re-running setup is how people respond to a failure, not
+        how they re-point a repo. The exceptions are the two states that are not
+        a decision: no binding at all, and a binding to a pot that no longer
+        exists (a run that stopped between ``add_source`` and the binding).
+        """
+        try:
+            current = self.pots.repo_default(repo=location)
+            if current and any(p.pot_id == current for p in self.pots.list_pots()):
+                return
+            self.pots.set_repo_default(repo=location, pot_id=pot_id)
+        except Exception:  # noqa: BLE001 - routing repair must not fail a soft step
+            return
+
+    def _skills(self, plan: SetupPlan) -> str | StepResult:
+        if plan.agent.strip().lower() == "default":
+            return StepResult(
+                "skills", SKIPPED, "no global skill target for default agent"
+            )
+        result = self.skills.install(agent=plan.agent)
+        return f"installed {list(result.changed)} for {plan.agent}"
+
+
+def _describe(result: object) -> str | None:
+    return None if result is None else str(result)
+
+
+__all__ = ["DefaultSetupOrchestrator"]
+
+
+def _matching_repo_source(sources, *, repo_key: str | None):
+    """The already-registered row for this repo, matched by identity key.
+
+    Both ``location`` and ``name`` are inspected: rows written before sources
+    carried a separate ``location`` hold the ref in ``name`` alone.
+    """
+    if not repo_key:
+        return None
+    for source in sources or []:
+        if getattr(source, "kind", None) != "repo":
+            continue
+        refs = (
+            str(getattr(source, "location", "") or "").strip(),
+            str(getattr(source, "name", "") or "").strip(),
+        )
+        if any(repo_identity_key(ref) == repo_key for ref in refs if ref):
+            return source
+    return None
+
+
+def _resolve_setup_repo_location(location: str) -> str:
+    raw = (location or "").strip()
+    if raw.lower() in (".", "current"):
+        cwd = Path.cwd().resolve()
+        remote = _current_git_remote(cwd)
+        return remote or str(cwd)
+    if raw.startswith((".", "~")):
+        return str(Path(raw).expanduser().resolve(strict=False))
+    return raw
+
+
+def _current_git_remote(cwd: Path) -> str | None:
+    # The shared probe and normalizer: ``source add repo .`` stores the same
+    # lower-cased key for the same repository, so the dedup above can compare
+    # stored refs.
+    return current_git_remote(cwd)

@@ -1,0 +1,177 @@
+"""``GraphMutationPort`` — the canonical write path of a ``GraphBackend``.
+
+Together with ``ClaimQueryPort`` this is the *source of truth*: every fact in
+the graph enters through ``apply`` and is read back through claim query. The
+other four capability ports are rebuildable projections off this store.
+
+Records (``context_record``) and reconciled source events both lower to a
+:class:`MutationBatch` and land here — there is one write door.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+
+from potpie_context_engine.core.graph_mutations import ProvenanceContext
+from potpie_context_engine.core.reconciliation import MutationBatch, MutationResult
+from potpie_context_engine.core.mutation_execution import MutationCapabilities
+
+
+@dataclass(frozen=True, slots=True)
+class BackendReadiness:
+    """Backend health/readiness, rolled into ``context_status`` backend
+    readiness. Defined here (not in ``backend``) so capability ports can
+    reference it without importing the bundle."""
+
+    profile: str
+    ready: bool
+    detail: str | None = None
+    capability_ready: Mapping[str, bool] = field(default_factory=dict)
+
+
+class MutationExecutionState(StrEnum):
+    absent = "absent"
+    in_flight = "in_flight"
+    completed = "completed"
+    ambiguous = "ambiguous"
+    unsupported = "unsupported"
+
+
+@dataclass(frozen=True, slots=True)
+class MutationExecutionLookup:
+    """Optional apply-once receipt lookup for recovery-aware mutation ports."""
+
+    state: str
+    mutation_id: str
+    batch_fingerprint: str
+    result: MutationResult | None = None
+    detail: str | None = None
+
+
+@runtime_checkable
+class AtomicGraphMutationPort(Protocol):
+    """Optional datastore-wide optimistic concurrency capability.
+
+    The version check, canonical batch, next version and durable receipt must
+    share one atomic boundary. Completed retries return the original receipt
+    before checking the now-outdated expected version. A different body using
+    that mutation ID is rejected. A stale new write raises
+    ``GraphMutationVersionConflict`` without applying any of its operations.
+    """
+
+    def current_version(self, pot_id: str) -> int: ...
+
+    def compare_and_apply(
+        self,
+        plan: MutationBatch,
+        *,
+        expected_pot_id: str,
+        expected_version: int,
+        provenance_context: ProvenanceContext | None = None,
+    ) -> MutationResult: ...
+
+
+@runtime_checkable
+class AsyncAtomicGraphMutationPort(Protocol):
+    async def current_version_async(self, pot_id: str) -> int: ...
+
+    async def compare_and_apply_async(
+        self,
+        plan: MutationBatch,
+        *,
+        expected_pot_id: str,
+        expected_version: int,
+        provenance_context: ProvenanceContext | None = None,
+    ) -> MutationResult: ...
+
+
+@runtime_checkable
+class RecoverableGraphMutationPort(Protocol):
+    @property
+    def capabilities(self) -> MutationCapabilities: ...
+
+    def lookup_execution(
+        self, plan: MutationBatch, *, expected_pot_id: str, mutation_id: str
+    ) -> MutationExecutionLookup: ...
+
+
+@runtime_checkable
+class AsyncRecoverableGraphMutationPort(Protocol):
+    @property
+    def capabilities(self) -> MutationCapabilities: ...
+
+    async def lookup_execution_async(
+        self, plan: MutationBatch, *, expected_pot_id: str, mutation_id: str
+    ) -> MutationExecutionLookup: ...
+
+
+@runtime_checkable
+class GraphMutationPort(Protocol):
+    """Apply typed mutation plans and lifecycle operations to the claim store."""
+
+    def apply(
+        self,
+        plan: MutationBatch,
+        *,
+        expected_pot_id: str,
+        provenance_context: ProvenanceContext | None = None,
+    ) -> MutationResult:
+        """Apply a constrained mutation batch (entity/edge upserts, deletes,
+        invalidations) against the canonical store for ``expected_pot_id``.
+
+        Sync entry, for non-async callers (CLI, tests). Backends whose store is
+        async (Neo4j) bridge with ``asyncio.run`` and therefore refuse to run
+        inside a running event loop — async callers must use :meth:`apply_async`.
+        """
+        ...
+
+    async def apply_async(
+        self,
+        plan: MutationBatch,
+        *,
+        expected_pot_id: str,
+        provenance_context: ProvenanceContext | None = None,
+    ) -> MutationResult:
+        """Async-native ``apply``. Preferred when called from inside an event
+        loop (FastAPI handlers, agent tools, Celery workers): backends whose
+        store is async (Neo4j) ``await`` their writer directly instead of
+        bridging through ``asyncio.run`` — which raises inside a running loop and
+        can cross-bind a connection pool to a dead loop. Sync backends just
+        return ``apply(...)``. Mirror of ``ContextGraphPort.apply_plan_async``."""
+        ...
+
+    def invalidate(
+        self,
+        *,
+        pot_id: str,
+        claim_keys: Sequence[str],
+        reason: str | None = None,
+    ) -> int:
+        """Soft-invalidate claims by key (stamp ``invalid_at``). Returns the
+        number of claims invalidated."""
+        ...
+
+    def reset_pot(
+        self, pot_id: str, *, mutation_id: str | None = None
+    ) -> dict[str, Any]:
+        """Hard-reset all graph state for a pot. Returns a summary of what was
+        removed and its execution identity for recoverable retries."""
+        ...
+
+    def readiness(self, pot_id: str) -> BackendReadiness:
+        """Cheap readiness probe for ``context_status`` / ``backend status``."""
+        ...
+
+
+__all__ = [
+    "AtomicGraphMutationPort",
+    "AsyncAtomicGraphMutationPort",
+    "RecoverableGraphMutationPort",
+    "AsyncRecoverableGraphMutationPort",
+    "BackendReadiness",
+    "GraphMutationPort",
+    "MutationExecutionLookup",
+    "MutationExecutionState",
+]

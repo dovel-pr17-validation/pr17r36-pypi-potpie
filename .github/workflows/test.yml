@@ -1,0 +1,492 @@
+name: Build and test distributions
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distributions-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  UV_HTTP_TIMEOUT: "300"
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch pinned conformance history
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t refs < <(
+            sed -nE \
+              's/^(spec_ref|implementation_ref|previous_record_ref|target_base_commit|target_pr_head_commit): ([0-9a-f]{40})$/\2/p' \
+              spec/conformance/*.md | sort -u
+          )
+          for ref in "${refs[@]}"; do
+            if ! git cat-file -e "${ref}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "${ref}"
+            fi
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.10.7"
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+
+      - name: Install pre-commit
+        run: python -m pip install pre-commit==4.5.1
+
+      - name: Run pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure
+
+
+  build-distributions:
+    name: Build product and workspace distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: potpie/daemon/http/ui/frontend/package-lock.json
+      - name: Build the graph explorer once
+        run: make ui-build-ci
+      - name: Build wheels and source distributions
+        run: |
+          python -m pip install --requirement .github/requirements/python-release.txt
+          python -m build --outdir dist/root .
+          python -m build --outdir dist/engine potpie/context-engine
+          python -m build --outdir dist/integrations potpie/integrations
+          python -m twine check dist/*/*
+          python scripts/distribution_manifest.py create dist --commit "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-distributions
+          path: dist/
+          if-no-files-found: error
+
+  build-parsing:
+    name: Build parsing wheel (Linux, Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.10.7"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - name: Build the interpreter-specific native wheel
+        run: >-
+          uvx --from 'maturin>=1.13,<2' maturin build --release
+          --manifest-path potpie/parsing/Cargo.toml --interpreter python
+          --compatibility linux --out dist/parsing
+      - name: Build the source distribution once
+        if: matrix.python == '3.13'
+        run: >-
+          uvx --from 'maturin>=1.13,<2' maturin sdist
+          --manifest-path potpie/parsing/Cargo.toml --out dist/parsing
+      - name: Record native artifact identity
+        run: python scripts/distribution_manifest.py create dist --commit "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-parsing-${{ matrix.python }}
+          path: dist/
+          if-no-files-found: error
+
+  build-falkordblite:
+    name: Build FalkorDB Lite (Linux ARM64, Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: python:${{ matrix.python }}-bookworm
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build prerequisites
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends build-essential ca-certificates \
+            patchelf binutils libssl-dev libgomp1
+          python -m pip install build
+      - name: Build repaired wheel from the source archive
+        run: |
+          python -m build --sdist --outdir dist/source scripts/packaging/falkordblite
+          python -m pip wheel --no-deps --wheel-dir dist/vendor dist/source/*.tar.gz
+          python scripts/distribution_manifest.py create dist --commit "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-falkordblite-${{ matrix.python }}
+          path: dist/
+          if-no-files-found: error
+
+  artifact-smoke:
+    name: Artifact smoke (${{ matrix.target }}, Python ${{ matrix.python }}, ${{ matrix.profile }})
+    needs: [build-distributions, build-parsing, build-falkordblite]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-latest, target: linux-x86_64, python: "3.12", profile: base}
+          - {runner: ubuntu-latest, target: linux-x86_64, python: "3.13", profile: base}
+          - {runner: ubuntu-latest, target: linux-x86_64, python: "3.14", profile: base}
+          - {runner: windows-latest, target: windows-amd64, python: "3.13", profile: base}
+          - {runner: macos-latest, target: macos-arm64, python: "3.13", profile: base}
+          - {runner: ubuntu-latest, target: linux-x86_64, python: "3.13", profile: engine}
+          - {runner: ubuntu-latest, target: linux-x86_64, python: "3.12", profile: parsing}
+          - {runner: ubuntu-latest, target: linux-x86_64, python: "3.13", profile: parsing}
+          - {runner: ubuntu-latest, target: linux-x86_64, python: "3.14", profile: parsing}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        if: matrix.profile != 'parsing'
+        with:
+          name: dist-distributions
+          path: artifacts/distributions
+      - uses: actions/download-artifact@v4
+        if: matrix.profile == 'parsing'
+        with:
+          name: dist-parsing-${{ matrix.python }}
+          path: artifacts/parsing
+      - name: Install the exact local artifacts and exercise the product
+        run: |
+          python -m venv "$RUNNER_TEMP/artifact-smoke"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            artifact_python="$RUNNER_TEMP/artifact-smoke/Scripts/python.exe"
+          else
+            artifact_python="$RUNNER_TEMP/artifact-smoke/bin/python"
+          fi
+          "$artifact_python" scripts/test_distributions.py --artifacts artifacts \
+            --commit "$GITHUB_SHA" --target '${{ matrix.target }}' --profile '${{ matrix.profile }}'
+
+  test-root:
+    name: Root suite (installed artifacts, Python 3.13)
+    needs: [build-distributions, build-parsing, build-falkordblite]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.10.7"
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-distributions
+          path: artifacts/distributions
+      - name: Install the root and local engine wheel pair
+        run: |
+          python -m venv "$RUNNER_TEMP/root-tests"
+          "$RUNNER_TEMP/root-tests/bin/python" scripts/test_distributions.py \
+            --artifacts artifacts --commit "$GITHUB_SHA" --target linux-x86_64 --profile full --install-only
+          "$RUNNER_TEMP/root-tests/bin/python" -m pip install pytest pytest-asyncio build hatchling packaging
+      - name: Run root behavior, frontend and source contracts
+        run: |
+          "$RUNNER_TEMP/root-tests/bin/python" scripts/test_suites.py root --profile installed
+          "$RUNNER_TEMP/root-tests/bin/python" scripts/test_suites.py root --profile source --checks python
+      - name: Verify the independent integrations wheel
+        run: |
+          python -m venv "$RUNNER_TEMP/integrations-tests"
+          "$RUNNER_TEMP/integrations-tests/bin/python" scripts/test_distributions.py \
+            --artifacts artifacts --commit "$GITHUB_SHA" --target linux-x86_64 --profile integrations --install-only
+          "$RUNNER_TEMP/integrations-tests/bin/python" -m pip install pytest
+          "$RUNNER_TEMP/integrations-tests/bin/python" scripts/test_suites.py integrations --profile installed
+
+  test-context-engine:
+    name: Engine suite (installed artifact, Python 3.13)
+    needs: [build-distributions, build-parsing, build-falkordblite]
+    runs-on: ubuntu-latest
+    env:
+      POTPIE_RELIABILITY_PROFILES: in_memory,embedded,falkordb_lite,falkordb,neo4j
+      PROTOCOL_TEST_FALKORDB_URL: redis://127.0.0.1:6380
+      POTPIE_JOURNAL_FALKOR_PORT: "6380"
+      PROTOCOL_TEST_NEO4J_URI: bolt://127.0.0.1:7687
+      PROTOCOL_TEST_NEO4J_USERNAME: neo4j
+      PROTOCOL_TEST_NEO4J_PASSWORD: protocol-test
+      POSTGRES_SERVER: postgresql://postgres:postgres@localhost:5432/postgres
+      ENV: development
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 5
+      protocol-falkordb:
+        image: falkordb/falkordb:v4.16.0
+        env:
+          BROWSER: "0"
+          REDIS_ARGS: --appendonly yes --appendfsync always
+        ports: ["6380:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      protocol-neo4j:
+        image: neo4j:5.26-community
+        env:
+          NEO4J_AUTH: neo4j/protocol-test
+        ports: ["7687:7687"]
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p protocol-test 'RETURN 1'"
+          --health-interval 10s --health-timeout 10s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.10.7"
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-distributions
+          path: artifacts/distributions
+      - name: Install the independent engine wheel with its test extras
+        run: |
+          python -m venv "$RUNNER_TEMP/engine-tests"
+          "$RUNNER_TEMP/engine-tests/bin/python" scripts/test_distributions.py \
+            --artifacts artifacts --commit "$GITHUB_SHA" --target linux-x86_64 --profile engine-full --install-only
+          "$RUNNER_TEMP/engine-tests/bin/python" -m pip install pytest pytest-asyncio build hatchling packaging
+      - name: Start the isolated graph crash fixture
+        run: |
+          docker run -d --name pie-journal-crash-ci -p 127.0.0.1:6381:6379 \
+            -e BROWSER=0 -e 'REDIS_ARGS=--appendonly yes --appendfsync always' falkordb/falkordb:v4.16.0
+          for _ in $(seq 1 30); do
+            if docker exec pie-journal-crash-ci redis-cli ping | grep -q PONG; then exit 0; fi
+            sleep 1
+          done
+          docker logs pie-journal-crash-ci
+          exit 1
+      - name: Run general behavior and source contracts
+        env:
+          POTPIE_JOURNAL_CRASH_CONTAINER: pie-journal-crash-ci
+          POTPIE_JOURNAL_CRASH_PORT: "6381"
+        run: |
+          "$RUNNER_TEMP/engine-tests/bin/python" scripts/test_suites.py engine --profile installed --tier general
+          "$RUNNER_TEMP/engine-tests/bin/python" scripts/test_suites.py engine --profile source --checks python
+      - name: Require graph acceptance without skips
+        run: >-
+          "$RUNNER_TEMP/engine-tests/bin/python" scripts/test_suites.py engine
+          --profile installed --tier graph
+      - name: Require serial native restart recovery without skips
+        env:
+          POTPIE_TEST_FALKORDB_RESTART_CONTAINER: ${{ job.services.protocol-falkordb.id }}
+          PROTOCOL_TEST_NEO4J_CONTAINER: ${{ job.services.protocol-neo4j.id }}
+          POTPIE_JOURNAL_CRASH_CONTAINER: pie-journal-crash-ci
+          POTPIE_JOURNAL_CRASH_PORT: "6381"
+        run: >-
+          "$RUNNER_TEMP/engine-tests/bin/python" scripts/test_suites.py engine
+          --profile installed --tier restart
+
+  test-parsing:
+    name: Parsing Python and Rust suite (Python 3.13)
+    needs: [build-distributions, build-parsing, build-falkordblite]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-parsing-*
+          path: artifacts
+      - name: Install the selected native wheel and test bindings and algorithms
+        run: |
+          python -m venv "$RUNNER_TEMP/parsing-tests"
+          "$RUNNER_TEMP/parsing-tests/bin/python" scripts/test_distributions.py \
+            --artifacts artifacts --commit "$GITHUB_SHA" --target linux-x86_64 --profile parsing --install-only
+          "$RUNNER_TEMP/parsing-tests/bin/python" -m pip install pytest pytest-asyncio
+          "$RUNNER_TEMP/parsing-tests/bin/python" scripts/test_suites.py parsing --profile installed
+
+  test-windows:
+    name: Windows product contracts (installed artifacts, Python 3.13)
+    needs: [build-distributions, build-parsing, build-falkordblite]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-distributions
+          path: artifacts/distributions
+      - name: Install and exercise Windows runtime, persistence and Ladybug
+        run: |
+          python -m venv "$RUNNER_TEMP/windows-tests"
+          artifact_python="$RUNNER_TEMP/windows-tests/Scripts/python.exe"
+          "$artifact_python" scripts/test_distributions.py --artifacts artifacts \
+            --commit "$GITHUB_SHA" --target windows-amd64 --profile native --install-only
+          "$artifact_python" -m pip install pytest pytest-asyncio
+          "$artifact_python" scripts/test_suites.py root --profile windows --checks python
+          "$artifact_python" scripts/test_suites.py engine --profile windows --checks python
+
+  test-native-arm-linux:
+    name: Linux ARM64 acceptance (Python ${{ matrix.python }})
+    needs: [build-distributions, build-parsing, build-falkordblite]
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: python:${{ matrix.python }}-bookworm
+      options: --init
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.2
+    env:
+      CONTEXT_ENGINE_QDRANT_URL: http://qdrant:6333
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-distributions
+          path: artifacts/distributions
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-falkordblite-${{ matrix.python }}
+          path: artifacts/falkordblite
+      - name: Install native runtime libraries
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends libgomp1 ca-certificates
+      - name: Wait for Qdrant
+        run: |
+          python - <<'PY'
+          import os, time, urllib.error, urllib.request
+          endpoint = os.environ['CONTEXT_ENGINE_QDRANT_URL'] + '/readyz'
+          for attempt in range(30):
+              try:
+                  with urllib.request.urlopen(endpoint, timeout=2) as response:
+                      if response.status == 200:
+                          break
+              except (urllib.error.URLError, TimeoutError):
+                  pass
+              time.sleep(1)
+          else:
+              raise SystemExit('Qdrant did not become ready')
+          PY
+      - name: Test the exact repaired wheel on its native host
+        run: |
+          python -m venv "$RUNNER_TEMP/arm-tests"
+          artifact_python="$RUNNER_TEMP/arm-tests/bin/python"
+          "$artifact_python" scripts/test_distributions.py --artifacts artifacts \
+            --commit "$GITHUB_SHA" --target linux-aarch64 --profile native --install-only
+          "$artifact_python" -m pip install pytest pytest-asyncio
+          "$artifact_python" -I scripts/test_arm_wheels.py --repo "$GITHUB_WORKSPACE" \
+            --target linux --reports "$GITHUB_WORKSPACE/reports"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-arm64-results-${{ matrix.python }}
+          path: reports/*.xml
+
+  test-native-arm-windows:
+    name: Windows ARM64 acceptance (Python ${{ matrix.python }})
+    needs: [build-distributions, build-parsing, build-falkordblite]
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Later 3.12 security releases do not have a setup-python ARM64 binary.
+        python: ["3.12.10", "3.13", "3.14"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-distributions
+          path: artifacts/distributions
+      - name: Test installed artifacts on native Windows ARM
+        run: |
+          python -m venv "$RUNNER_TEMP/arm-tests"
+          artifact_python="$RUNNER_TEMP/arm-tests/Scripts/python.exe"
+          "$artifact_python" scripts/test_distributions.py --artifacts artifacts \
+            --commit "$GITHUB_SHA" --target windows-arm64 --profile native --install-only
+          "$artifact_python" -m pip install pytest pytest-asyncio
+          "$artifact_python" -I scripts/test_arm_wheels.py --repo "$GITHUB_WORKSPACE" \
+            --target windows --reports "$GITHUB_WORKSPACE/reports"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-arm64-results-${{ matrix.python }}
+          path: reports/*.xml

@@ -1,0 +1,290 @@
+"""In-memory :class:`ClaimQueryPort` for tests + offline benches.
+
+Production uses the Neo4j adapter against the canonical edge store. This
+implementation is *not* a substitute for that — it covers the filter semantics
+defined on :class:`ClaimQueryFilter` so reader tests can drive every code path
+without a live graph.
+
+Semantic match (R1): when an :class:`EmbedderPort` is wired, ``fact_query`` runs
+a real cosine-similarity ranking over the persisted ``fact_embedding`` (embedding
+the retrieval card on the fly for rows that lack one). With no embedder it falls
+back to the canonical lexical token-overlap scorer
+(``match_mode == "lexical"``), so an empty result is debuggable rather than a
+silent stub.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import threading
+from contextlib import contextmanager
+from functools import wraps
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+from potpie_context_engine.core.ports.claim_query import ClaimQueryFilter, ClaimRow
+
+from potpie_context_engine.adapters.outbound.graph.canonical_claim_query import (
+    claim_matches_post_filter,
+    embedding_score,
+)
+
+from potpie_context_engine.domain.ports.embedder import EmbedderPort
+from potpie_context_engine.domain.retrieval_card import (
+    build_retrieval_card,
+    cosine_similarity,
+)
+
+
+def coherent_store_read(method):
+    """Hold one store snapshot throughout a capability read, including nested reads."""
+
+    @wraps(method)
+    def read(self, *args, **kwargs):
+        with self.store.read_guard():
+            return method(self, *args, **kwargs)
+
+    return read
+
+
+def _coherent_read(method):
+    @wraps(method)
+    def read(self, *args, **kwargs):
+        with self.read_guard():
+            return method(self, *args, **kwargs)
+
+    return read
+
+
+@dataclass(slots=True)
+class InMemoryClaimQueryStore:
+    rows: list[ClaimRow] = field(default_factory=list)
+    entity_label_index: dict[tuple[str, str], tuple[str, ...]] = field(
+        default_factory=dict
+    )
+    entity_property_index: dict[tuple[str, str], dict[str, Any]] = field(
+        default_factory=dict
+    )
+    embedder: EmbedderPort | None = None
+    state_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    before_read: Callable[[], None] | None = field(default=None, repr=False)
+    _read_context: threading.local = field(default_factory=threading.local, repr=False)
+
+    @contextmanager
+    def read_guard(self) -> Iterator[None]:
+        # Refresh before taking the state lock: embedded writers take the file
+        # lock first. Nested reads already own a coherent snapshot and must not
+        # refresh it halfway through an inspection or bulk property query.
+        nested = getattr(self._read_context, "depth", 0)
+        if not nested and self.before_read is not None:
+            self.before_read()
+        with self.state_lock:
+            self._read_context.depth = nested + 1
+            try:
+                yield
+            finally:
+                self._read_context.depth = nested
+
+    @property
+    def match_mode(self) -> str:
+        """Active semantic-match mode: ``vector`` (embedder) or ``lexical``."""
+        return "vector" if self.embedder is not None else "lexical"
+
+    # ------------------------------------------------------------------
+    # Loading helpers (used by tests + benches to populate the store)
+    # ------------------------------------------------------------------
+    def add(self, row: ClaimRow) -> None:
+        self.rows.append(row)
+
+    def add_many(self, rows: Iterable[ClaimRow]) -> None:
+        self.rows.extend(rows)
+
+    def set_entity_label(
+        self, *, pot_id: str, entity_key: str, labels: Iterable[str]
+    ) -> None:
+        self.entity_label_index[(pot_id, entity_key)] = tuple(labels)
+
+    def set_entity_properties(
+        self, *, pot_id: str, entity_key: str, properties: Mapping[str, Any]
+    ) -> None:
+        """Merge entity properties (name / description / …) for richer reads."""
+        if not properties:
+            return
+        bucket = self.entity_property_index.setdefault((pot_id, entity_key), {})
+        bucket.update({k: v for k, v in properties.items()})
+
+    @_coherent_read
+    def entity_properties_many(
+        self, *, pot_id: str, entity_keys: Iterable[str]
+    ) -> dict[str, dict[str, Any]]:
+        return {
+            key: self.entity_properties(pot_id=pot_id, entity_key=key)
+            for key in entity_keys
+        }
+
+    @_coherent_read
+    def entity_properties(self, *, pot_id: str, entity_key: str) -> dict[str, Any]:
+        properties = self.entity_property_index.get((pot_id, entity_key), {})
+        return {} if properties.get("retired", False) else dict(properties)
+
+    # ------------------------------------------------------------------
+    # ClaimQueryPort
+    # ------------------------------------------------------------------
+    @_coherent_read
+    def find_claims(self, filter_: ClaimQueryFilter) -> list[ClaimRow]:
+        query_time = filter_.as_of or datetime.now(timezone.utc)
+        candidates = [
+            row
+            for row in self.rows
+            if row.pot_id == filter_.pot_id
+            and (
+                filter_.include_retired
+                or (
+                    not row.retired
+                    and not self.entity_property_index.get(
+                        (row.pot_id, row.subject_key), {}
+                    ).get("retired", False)
+                    and not self.entity_property_index.get(
+                        (row.pot_id, row.object_key), {}
+                    ).get("retired", False)
+                )
+            )
+        ]
+        candidates = [
+            row
+            for row in candidates
+            if _matches_filter(row, filter_, self)
+            and claim_matches_post_filter(row, filter_, query_time=query_time)
+        ]
+
+        if filter_.fact_query:
+            candidates = self._semantic_rank(candidates, filter_.fact_query)
+
+        if filter_.limit is not None and filter_.limit >= 0:
+            candidates = candidates[: filter_.limit]
+        return candidates
+
+    @_coherent_read
+    def entity_labels(
+        self, *, pot_id: str, entity_keys: Iterable[str]
+    ) -> Mapping[str, tuple[str, ...]]:
+        out: dict[str, tuple[str, ...]] = {}
+        for key in entity_keys:
+            labels = self.entity_label_index.get((pot_id, key))
+            if labels and not self.entity_property_index.get((pot_id, key), {}).get(
+                "retired", False
+            ):
+                out[key] = labels
+        return out
+
+    # ------------------------------------------------------------------
+    # Semantic ranking
+    # ------------------------------------------------------------------
+    def _semantic_rank(self, candidates: list[ClaimRow], query: str) -> list[ClaimRow]:
+        if self.embedder is not None:
+            try:
+                qvec = self.embedder.embed(query)
+                scored = [
+                    (row, cosine_similarity(qvec, self._row_vector(row)))
+                    for row in candidates
+                ]
+            except Exception:  # noqa: BLE001 - fall back to labeled lexical search.
+                scored = [(row, embedding_score(row.fact, query)) for row in candidates]
+        else:
+            scored = [(row, embedding_score(row.fact, query)) for row in candidates]
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        return [_stamp_similarity(row, score) for row, score in scored]
+
+    def _row_vector(self, row: ClaimRow) -> tuple[float, ...]:
+        if row.fact_embedding:
+            return row.fact_embedding
+        # No persisted embedding (old data / hand-built test row): embed the
+        # card on the fly so the row still participates in vector ranking.
+        assert self.embedder is not None
+        return self.embedder.embed(card_for_row(row))
+
+
+def card_for_row(row: ClaimRow) -> str:
+    """Build the retrieval card for a stored claim row (read-side / on-the-fly embed)."""
+    props = row.properties or {}
+    return build_retrieval_card(
+        description=row.description or props.get("description"),
+        fact=row.fact,
+        subject_key=row.subject_key,
+        predicate=row.predicate,
+        object_key=row.object_key,
+        scope=props.get("code_scope")
+        if isinstance(props.get("code_scope"), Mapping)
+        else None,
+    )
+
+
+def _stamp_similarity(row: ClaimRow, score: float) -> ClaimRow:
+    props = dict(row.properties)
+    props["semantic_similarity"] = score
+    return dataclasses.replace(row, properties=props)
+
+
+def _matches_filter(
+    row: ClaimRow, filter_: ClaimQueryFilter, store: InMemoryClaimQueryStore
+) -> bool:
+    if filter_.predicate_in and row.predicate not in filter_.predicate_in:
+        return False
+    if filter_.subject_key_in and row.subject_key not in filter_.subject_key_in:
+        return False
+    if filter_.object_key_in and row.object_key not in filter_.object_key_in:
+        return False
+    if filter_.claim_key_in and row.claim_key not in filter_.claim_key_in:
+        return False
+    if filter_.record_id_in and row.record_id not in filter_.record_id_in:
+        return False
+    if filter_.subgraph_in and row.subgraph not in filter_.subgraph_in:
+        return False
+    if filter_.subgraph_not_in and row.subgraph in filter_.subgraph_not_in:
+        return False
+    if filter_.mutation_id_in and row.mutation_id not in filter_.mutation_id_in:
+        return False
+    if filter_.source_ref_in and not _row_matches_source_refs(
+        row, filter_.source_ref_in
+    ):
+        return False
+    if filter_.source_system_in and row.source_system not in filter_.source_system_in:
+        return False
+    if filter_.endpoint_label:
+        subject_labels = store.entity_label_index.get((row.pot_id, row.subject_key), ())
+        object_labels = store.entity_label_index.get((row.pot_id, row.object_key), ())
+        if filter_.endpoint_label not in (*subject_labels, *object_labels):
+            return False
+    if filter_.subject_label:
+        labels = store.entity_label_index.get((row.pot_id, row.subject_key), ())
+        if filter_.subject_label not in labels:
+            return False
+    if filter_.object_label:
+        labels = store.entity_label_index.get((row.pot_id, row.object_key), ())
+        if filter_.object_label not in labels:
+            return False
+    return True
+
+
+def _row_matches_source_refs(row: ClaimRow, wanted: Iterable[str]) -> bool:
+    wanted_set = {str(ref).strip().lower() for ref in wanted if str(ref).strip()}
+    if not wanted_set:
+        return True
+    refs = []
+    if row.source_ref:
+        refs.append(row.source_ref)
+    refs.extend(row.source_refs)
+    for item in row.evidence:
+        if not isinstance(item, Mapping):
+            continue
+        # The evidence DTO serializes the pointer as ``ref``; accept both that
+        # and the canonical ``source_ref`` so DTO-shaped evidence still matches.
+        ref = item.get("source_ref") or item.get("ref")
+        if isinstance(ref, str):
+            refs.append(ref)
+    return any(ref.strip().lower() in wanted_set for ref in refs if ref)
+
+
+__all__ = ["InMemoryClaimQueryStore", "card_for_row"]

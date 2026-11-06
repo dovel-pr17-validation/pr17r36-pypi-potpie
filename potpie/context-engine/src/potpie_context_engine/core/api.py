@@ -1,0 +1,434 @@
+"""The supported core import surface of potpie-context-engine.
+
+Consumers embedding the graph core — the potpie product distribution, the
+context engine, or a headless deployment — import from here instead of from
+internal module paths, so internal moves do not break them:
+
+    from potpie_context_engine.core.api import GraphBackend, GraphWorkbenchService
+
+Groups, top to bottom: the ontology catalog, context records, semantic
+mutations and their transforms, the workbench, and the graph ports a
+runtime implements.
+"""
+
+from __future__ import annotations
+
+# --- Ontology: the single catalog of labels, predicates, and record types.
+from potpie_context_engine.core.ontology import (
+    EDGE_TYPES,
+    ENTITY_TYPES,
+    PUBLIC_RECORD_TYPES,
+    RECORD_TYPES,
+    EdgeTypeSpec,
+    EntityTypeSpec,
+    RecordTypeSpec,
+)
+from potpie_context_engine.core.definition import (
+    DEFAULT_GRAPH_DEFINITION,
+    GraphDefinition,
+    GraphDefinitionError,
+    GraphReader,
+    GraphReaderFactory,
+    GraphReaderSpec,
+)
+from potpie_context_engine.core.graph_views import GraphViewSpec
+from potpie_context_engine.core.identity import (
+    IdentityClass,
+    IdentityError,
+    IdentitySpec,
+    mint_entity_key,
+    validate_entity_key,
+)
+
+# --- Context records: the typed durable-memory vocabulary.
+from potpie_context_engine.core.context_records import (
+    REQUIRED_DETAIL_KEYS,
+    BugPatternRecord,
+    ContextRecordValidationError,
+    DecisionRecord,
+    FixRecord,
+    FreeFormRecord,
+    PreferenceRecord,
+    required_detail_keys,
+)
+
+# --- Semantic mutations: how records become graph writes.
+from potpie_context_engine.core.semantic_mutations import (
+    GraphEntityRef,
+    GraphEvidenceRef,
+    LoweredOperation,
+    MutationActor,
+    SemanticMutation,
+    SemanticMutationParseError,
+    SemanticMutationPlan,
+    SemanticMutationRequest,
+    SemanticMutationResult,
+)
+from potpie_context_engine.core.graph_mutations import (
+    EdgeDelete,
+    EdgeUpsert,
+    EntityUpsert,
+    InvalidationOp,
+    ProvenanceContext,
+)
+from potpie_context_engine.core.reconciliation import (
+    MutationBatch,
+    MutationResult,
+    MutationSummary,
+)
+from potpie_context_engine.core.record_to_semantic import (
+    record_to_semantic_request,
+)
+from potpie_context_engine.core.semantic_mutation_lowering import (
+    lower_semantic_request,
+)
+from potpie_context_engine.core.semantic_mutation_validator import (
+    validate_semantic_request,
+)
+
+# --- Workbench: the catalog/read/search/mutate command surface.
+from potpie_context_engine.core.workbench_service import (
+    GraphWorkbenchService,
+)
+from potpie_context_engine.core.agent_envelope import (
+    CoverageReport as AgentCoverageReport,
+    EvidenceItem,
+    UnsupportedInclude,
+)
+from potpie_context_engine.core.graph_workbench import (
+    GraphCommandEnvelope,
+    GraphCommandError,
+    GraphRecommendedAction,
+    GraphUnsupported,
+    GraphUnsupportedResult,
+    GraphWorkbenchStatus,
+)
+from potpie_context_engine.core.graph_history import (
+    GraphHistoryEntry,
+    GraphHistoryRequest,
+    GraphHistoryResult,
+)
+from potpie_context_engine.core.graph_inbox import (
+    GraphInboxItem,
+    GraphInboxResult,
+    GraphInboxStatus,
+)
+from potpie_context_engine.core.graph_plans import (
+    GraphIngestionVerificationResult,
+    GraphMutationApproval,
+    GraphMutationCommitResult,
+    GraphMutationDiff,
+    GraphMutationPlanRecord,
+    GraphMutationPlanStatus,
+    GraphMutationProposal,
+)
+from potpie_context_engine.core.graph_quality import (
+    GraphQualityFinding,
+    GraphQualityIssue,
+    GraphQualityReport,
+    GraphQualityResult,
+)
+from potpie_context_engine.core.mutation_policy import (
+    DEFAULT_MUTATION_POLICY,
+    GraphMutationPolicy,
+)
+from potpie_context_engine.core.reconciliation_config import (
+    DEFAULT_RECONCILIATION_CONFIG,
+    ReconciliationConfig,
+)
+from potpie_context_engine.core.reconciliation_flags import (
+    reconciliation_config_from_env,
+)
+from potpie_context_engine.core.runtime import (
+    GraphObserver,
+    NoOpGraphObserver,
+    RuntimeCompositionError,
+    run_in_worker_thread,
+)
+from potpie_context_engine.core.lifecycle import SetupPlan, StepResult
+from potpie_context_engine.core.serialization import from_transport, to_transport
+
+# --- Ports: the contracts a graph runtime implements.
+from potpie_context_engine.core.agent_envelope import AgentEnvelope
+from potpie_context_engine.core.errors import CapabilityNotImplemented
+from potpie_context_engine.core.ports.agent_context import (
+    RecordReceipt,
+    RecordRequest,
+    ResolveRequest,
+    SearchRequest,
+    StatusReport,
+    StatusRequest,
+)
+from potpie_context_engine.core.ports.claim_query import (
+    AsyncClaimQueryPort,
+    ClaimQueryFilter,
+    ClaimQueryPort,
+    ClaimRow,
+)
+from potpie_context_engine.core.ports.graph.analytics import (
+    GraphAnalyticsPort,
+    RepairFinding,
+    RepairReport,
+)
+from potpie_context_engine.core.ports.graph.backend import (
+    BackendCapabilities,
+    GraphBackend,
+)
+from potpie_context_engine.core.ports.graph.inbox_store import (
+    AsyncGraphInboxStorePort,
+    GraphInboxStorePort,
+)
+from potpie_context_engine.core.ports.graph.inspection import (
+    GraphEdge,
+    GraphInspectionPort,
+    GraphNode,
+    GraphSlice,
+)
+from potpie_context_engine.core.ports.graph.mutation import (
+    BackendReadiness,
+    GraphMutationPort,
+    MutationExecutionLookup,
+    MutationExecutionState,
+)
+from potpie_context_engine.core.ports.graph.plan_store import (
+    AsyncGraphPlanStorePort,
+    GraphPlanStorePort,
+)
+from potpie_context_engine.core.ports.graph.semantic import SemanticSearchPort
+from potpie_context_engine.core.ports.graph.snapshot import (
+    GraphSnapshotPort,
+    SnapshotManifest,
+)
+from potpie_context_engine.core.ports.graph_service import (
+    DataPlaneStatus,
+    GraphCatalogRequest,
+    GraphCatalogResult,
+    GraphDescribeRequest,
+    GraphEntityCandidate,
+    GraphEntitySearchRequest,
+    GraphEntitySearchResult,
+    GraphReadRequest,
+    GraphReadResult,
+    GraphService,
+)
+from potpie_context_engine.core.ports.resource_index import (
+    MATCH_MODE_DISABLED,
+    MATCH_MODE_HYBRID,
+    MATCH_MODE_LEXICAL,
+    MATCH_MODE_SEMANTIC,
+    MATCH_MODES,
+    ChunkHit,
+    DrainReport,
+    IndexCapabilities,
+    IndexReport,
+    IndexSearchResult,
+    ResourceIndexError,
+    ResourceIndexPort,
+    ResourceIndexStatus,
+)
+from potpie_context_engine.core.ports.resource_store import (
+    DEFAULT_SECTION_SLUG,
+    RECOMMENDED_MAX_SECTION_CHUNKS,
+    RESOURCE_CHUNK_MAX_CHARS,
+    RESOURCE_CHUNK_TARGET_CHARS,
+    RESOURCE_IMPORT_MAX_BYTES,
+    RESOURCE_SEQ_WIDTH,
+    RESOURCE_URI_PREFIX,
+    Chunk,
+    ChunkRef,
+    DocumentManifest,
+    ImportFiles,
+    ResourceId,
+    ResourceBatchResult,
+    ResourceReadOutcome,
+    ResourceStoreError,
+    ResourceStorePort,
+    ResourceStoreStatus,
+    SectionManifest,
+    format_resource_id,
+    import_source,
+    parse_resource_id,
+    read_import_files,
+    require_resource_slug,
+)
+from potpie_context_engine.core.resource_to_semantic import (
+    ResourceImportResult,
+    resource_delete_to_semantic_request,
+    resource_import_to_semantic_request,
+)
+
+__all__ = [
+    # ontology
+    "EDGE_TYPES",
+    "ENTITY_TYPES",
+    "PUBLIC_RECORD_TYPES",
+    "RECORD_TYPES",
+    "DEFAULT_GRAPH_DEFINITION",
+    "GraphDefinition",
+    "GraphDefinitionError",
+    "GraphReader",
+    "GraphReaderFactory",
+    "GraphReaderSpec",
+    "EntityTypeSpec",
+    "EdgeTypeSpec",
+    "RecordTypeSpec",
+    "GraphViewSpec",
+    "IdentityClass",
+    "IdentityError",
+    "IdentitySpec",
+    "mint_entity_key",
+    "required_detail_keys",
+    "validate_entity_key",
+    # records
+    "BugPatternRecord",
+    "ContextRecordValidationError",
+    "DecisionRecord",
+    "FixRecord",
+    "FreeFormRecord",
+    "PreferenceRecord",
+    "REQUIRED_DETAIL_KEYS",
+    # mutations + transforms
+    "SemanticMutation",
+    "MutationBatch",
+    "MutationResult",
+    "MutationSummary",
+    "EntityUpsert",
+    "EdgeUpsert",
+    "EdgeDelete",
+    "InvalidationOp",
+    "ProvenanceContext",
+    "GraphEntityRef",
+    "GraphEvidenceRef",
+    "LoweredOperation",
+    "MutationActor",
+    "SemanticMutationParseError",
+    "SemanticMutationPlan",
+    "SemanticMutationRequest",
+    "SemanticMutationResult",
+    "record_to_semantic_request",
+    "lower_semantic_request",
+    "validate_semantic_request",
+    # workbench
+    "GraphWorkbenchService",
+    "GraphCommandEnvelope",
+    "GraphCommandError",
+    "GraphRecommendedAction",
+    "GraphUnsupported",
+    "GraphUnsupportedResult",
+    "GraphWorkbenchStatus",
+    "AgentCoverageReport",
+    "EvidenceItem",
+    "UnsupportedInclude",
+    "GraphQualityFinding",
+    "GraphQualityIssue",
+    "GraphQualityReport",
+    "GraphQualityResult",
+    "GraphHistoryEntry",
+    "GraphHistoryRequest",
+    "GraphHistoryResult",
+    "GraphInboxItem",
+    "GraphInboxResult",
+    "GraphInboxStatus",
+    "GraphIngestionVerificationResult",
+    "GraphMutationApproval",
+    "GraphMutationCommitResult",
+    "GraphMutationDiff",
+    "GraphMutationPlanRecord",
+    "GraphMutationPlanStatus",
+    "GraphMutationProposal",
+    "DEFAULT_MUTATION_POLICY",
+    "DEFAULT_RECONCILIATION_CONFIG",
+    "GraphMutationPolicy",
+    "ReconciliationConfig",
+    "reconciliation_config_from_env",
+    "GraphObserver",
+    "NoOpGraphObserver",
+    "RuntimeCompositionError",
+    "run_in_worker_thread",
+    "SetupPlan",
+    "StepResult",
+    "from_transport",
+    "to_transport",
+    # ports
+    "AgentEnvelope",
+    "ClaimQueryPort",
+    "AsyncClaimQueryPort",
+    "ClaimQueryFilter",
+    "ClaimRow",
+    "CapabilityNotImplemented",
+    "BackendCapabilities",
+    "BackendReadiness",
+    "GraphBackend",
+    "AsyncGraphInboxStorePort",
+    "GraphInboxStorePort",
+    "GraphMutationPort",
+    "MutationExecutionLookup",
+    "MutationExecutionState",
+    "AsyncGraphPlanStorePort",
+    "GraphPlanStorePort",
+    "GraphAnalyticsPort",
+    "RepairFinding",
+    "RepairReport",
+    "GraphInspectionPort",
+    "GraphNode",
+    "GraphEdge",
+    "GraphSlice",
+    "SemanticSearchPort",
+    "GraphSnapshotPort",
+    "SnapshotManifest",
+    "GraphService",
+    "DataPlaneStatus",
+    "GraphCatalogRequest",
+    "GraphCatalogResult",
+    "GraphDescribeRequest",
+    "GraphEntityCandidate",
+    "GraphEntitySearchRequest",
+    "GraphEntitySearchResult",
+    "GraphReadRequest",
+    "GraphReadResult",
+    "ResourceBatchResult",
+    "ResourceReadOutcome",
+    "ResourceStorePort",
+    "ResourceStoreError",
+    "ResourceStoreStatus",
+    "ResourceImportResult",
+    "resource_delete_to_semantic_request",
+    "resource_import_to_semantic_request",
+    "ResourceId",
+    "Chunk",
+    "ChunkRef",
+    "SectionManifest",
+    "DocumentManifest",
+    "RESOURCE_URI_PREFIX",
+    "RESOURCE_CHUNK_TARGET_CHARS",
+    "RESOURCE_CHUNK_MAX_CHARS",
+    "RESOURCE_SEQ_WIDTH",
+    "DEFAULT_SECTION_SLUG",
+    "RECOMMENDED_MAX_SECTION_CHUNKS",
+    "ImportFiles",
+    "RESOURCE_IMPORT_MAX_BYTES",
+    "format_resource_id",
+    "import_source",
+    "parse_resource_id",
+    "read_import_files",
+    "require_resource_slug",
+    "ResourceIndexPort",
+    "ResourceIndexError",
+    "ResourceIndexStatus",
+    "IndexCapabilities",
+    "IndexSearchResult",
+    "IndexReport",
+    "DrainReport",
+    "ChunkHit",
+    "MATCH_MODES",
+    "MATCH_MODE_LEXICAL",
+    "MATCH_MODE_SEMANTIC",
+    "MATCH_MODE_HYBRID",
+    "MATCH_MODE_DISABLED",
+    "RecordReceipt",
+    "RecordRequest",
+    "ResolveRequest",
+    "SearchRequest",
+    "StatusReport",
+    "StatusRequest",
+]

@@ -1,0 +1,589 @@
+"""FalkorDB ``GraphBackend`` profile.
+
+This backend wraps the existing FalkorDB reader/writer adapters behind the same
+capability bundle used by Neo4j. Application services see only
+``GraphBackend``; Falkor-specific graph handles, Lite/server mode, and Cypher
+shim details stay in outbound adapters.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+from potpie_context_engine.core.definition import (
+    DEFAULT_GRAPH_DEFINITION,
+    GraphDefinition,
+)
+from potpie_context_engine.core.errors import (
+    CapabilityNotImplemented,
+    GraphMutationVersionConflict,
+)
+from potpie_context_engine.core.graph_mutations import InvalidationOp, ProvenanceContext
+from potpie_context_engine.core.mutation_execution import MutationCapabilities
+from potpie_context_engine.core.ports.claim_query import ClaimQueryPort
+from potpie_context_engine.core.ports.graph.backend import BackendCapabilities
+from potpie_context_engine.core.ports.graph.mutation import (
+    BackendReadiness,
+    MutationExecutionLookup,
+    MutationExecutionState,
+)
+from potpie_context_engine.core.reconciliation import MutationBatch, MutationResult
+from potpie_context_engine.core.reconciliation_config import ReconciliationConfig
+
+from potpie_context_engine.adapters.outbound.graph._mutation_execution import (
+    MutationExecutionRegistry,
+    mutation_batch_fingerprint,
+    validate_execution_replay,
+    validate_prepared_execution,
+)
+from potpie_context_engine.adapters.outbound.graph.apply_plan import (
+    apply_mutation_batch,
+)
+from potpie_context_engine.adapters.outbound.graph.backends.claim_query_semantic import (
+    ClaimQuerySemanticSearch,
+)
+from potpie_context_engine.adapters.outbound.graph.backends.falkordb_analytics import (
+    FalkorDBAnalytics,
+)
+from potpie_context_engine.adapters.outbound.graph.falkordb_inspection import (
+    FalkorDBInspection,
+)
+from potpie_context_engine.adapters.outbound.graph.falkordb_reader import (
+    FalkorDBClaimQueryStore,
+)
+from potpie_context_engine.adapters.outbound.graph.falkordb_writer import (
+    FalkorDBGraphProvider,
+    FalkorDBGraphWriter,
+    _local_extra_next_action,
+)
+from potpie_context_engine.adapters.outbound.graph.writer_port import GraphWriterPort
+from potpie_context_engine.domain.ports.provisioning import BackendProvisionResult
+
+_PROFILE = "falkordb"
+_LITE_PROFILE = "falkordb_lite"
+
+
+class _FalkorDBModeSettings:
+    """Settings adapter that pins FalkorDB runtime mode for a backend profile."""
+
+    def __init__(self, base: Any, mode: str) -> None:
+        self._base = base
+        self._mode = mode
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+    def falkordb_mode(self) -> str:
+        return self._mode
+
+
+def _missing_driver_module(settings: Any) -> str | None:
+    """The driver module this profile needs and does not have, if any.
+
+    Readiness used to be answered from what was *wired* — ``writer.enabled`` is
+    set during construction and stays true whether or not a handle can ever be
+    opened. Where the driver is absent (an engine install without the
+    ``local`` extra, or Windows, where FalkorDBLite publishes no build), that
+    produced the worst available ordering of two facts: ``potpie backend
+    doctor`` said ``ready: true`` with every capability ``true``, and the very
+    next read crashed. The diagnostic an operator runs first has to be the one
+    that is right.
+
+    A spec probe rather than an open: importability is exactly the question
+    ("was the extra installed?"), and it costs nothing and starts no server.
+    A driver that is present but broken is a different failure and still
+    surfaces where it always did.
+    """
+    import importlib.util
+
+    module = "falkordb" if settings.falkordb_mode() == "server" else "redislite"
+    try:
+        found = importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):  # pragma: no cover - malformed installation
+        found = False
+    return None if found else module
+
+
+def _run_sync(coro: Any) -> Any:
+    """Drive an async writer call from a sync backend port."""
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    coro.close()
+    raise RuntimeError(
+        "FalkorDBGraphBackend sync mutation cannot run inside an event loop; "
+        "use the async door (mutation.apply_async)."
+    )
+
+
+@dataclass(slots=True)
+class _FalkorDBMutation:
+    settings: Any
+    writer: GraphWriterPort
+    profile: str = _PROFILE
+    definition: GraphDefinition = DEFAULT_GRAPH_DEFINITION
+    execution_registry: MutationExecutionRegistry = field(
+        default_factory=MutationExecutionRegistry
+    )
+
+    @property
+    def atomic_mutations_supported(self) -> bool:
+        return hasattr(self.writer, "_get_graph")
+
+    @property
+    def capabilities(self) -> MutationCapabilities:
+        native = self.atomic_mutations_supported
+        return MutationCapabilities(
+            atomic_writes=native,
+            revision_check=native,
+            execution_lookup=native,
+            durable_receipts=native,
+        )
+
+    def _require_native(self) -> None:
+        if not self.atomic_mutations_supported:
+            raise CapabilityNotImplemented(
+                f"graph.{self.profile}.mutation.atomic",
+                detail="the injected writer has no authoritative native execution surface",
+            )
+
+    async def apply_async(
+        self,
+        plan: MutationBatch,
+        *,
+        expected_pot_id: str,
+        provenance_context: ProvenanceContext | None = None,
+        reconciliation_config: ReconciliationConfig | None = None,
+    ) -> MutationResult:
+        mutation_id = (
+            provenance_context.mutation_id
+            if provenance_context is not None and provenance_context.mutation_id
+            else uuid.uuid4().hex
+        )
+        context = replace(
+            provenance_context or ProvenanceContext(),
+            mutation_id=mutation_id,
+        )
+        validate_prepared_execution(
+            plan, pot_id=expected_pot_id, mutation_id=mutation_id, provenance=context
+        )
+        if not hasattr(self.writer, "_get_graph"):
+            result = await self.execution_registry.execute_async(
+                plan,
+                expected_pot_id=expected_pot_id,
+                mutation_id=mutation_id,
+                operation=lambda: apply_mutation_batch(
+                    self.writer,
+                    plan,
+                    expected_pot_id=expected_pot_id,
+                    provenance_context=context,
+                    definition=self.definition,
+                    reconciliation_config=reconciliation_config,
+                ),
+            )
+            validate_execution_replay(result, provenance=context)
+            return result
+        return await asyncio.to_thread(
+            self._compare_and_apply_sync,
+            plan,
+            expected_pot_id,
+            None,
+            context,
+            reconciliation_config,
+        )
+
+    def current_version(self, pot_id: str) -> int:
+        self._require_native()
+        from potpie_context_engine.adapters.outbound.graph.falkordb_atomic import (
+            current_version,
+        )
+
+        return current_version(self.writer._get_graph(), pot_id)
+
+    async def current_version_async(self, pot_id: str) -> int:
+        return await asyncio.to_thread(self.current_version, pot_id)
+
+    async def compare_and_apply_async(
+        self,
+        plan: MutationBatch,
+        *,
+        expected_pot_id: str,
+        expected_version: int,
+        provenance_context: ProvenanceContext | None = None,
+        reconciliation_config: ReconciliationConfig | None = None,
+    ) -> MutationResult:
+        return await asyncio.to_thread(
+            self.compare_and_apply,
+            plan,
+            expected_pot_id=expected_pot_id,
+            expected_version=expected_version,
+            provenance_context=provenance_context,
+            reconciliation_config=reconciliation_config,
+        )
+
+    def compare_and_apply(
+        self,
+        plan: MutationBatch,
+        *,
+        expected_pot_id: str,
+        expected_version: int,
+        provenance_context: ProvenanceContext | None = None,
+        reconciliation_config: ReconciliationConfig | None = None,
+    ) -> MutationResult:
+        context = replace(
+            provenance_context or ProvenanceContext(),
+            mutation_id=(provenance_context.mutation_id if provenance_context else None)
+            or uuid.uuid4().hex,
+        )
+        return self._compare_and_apply_sync(
+            plan, expected_pot_id, expected_version, context, reconciliation_config
+        )
+
+    def _compare_and_apply_sync(self, plan, pot_id, expected_version, context, config):
+        self._require_native()
+        from potpie_context_engine.adapters.outbound.graph.falkordb_atomic import (
+            apply_atomic,
+        )
+
+        while True:
+            version = (
+                self.current_version(pot_id)
+                if expected_version is None
+                else expected_version
+            )
+            try:
+                return apply_atomic(
+                    self.writer._get_graph(),
+                    plan,
+                    expected_pot_id=pot_id,
+                    expected_version=version,
+                    provenance_context=context,
+                    definition=self.definition,
+                    reconciliation_config=config,
+                    embedder=getattr(self.writer, "_embedder", None),
+                )
+            except GraphMutationVersionConflict:
+                if expected_version is not None or context.prepared is not None:
+                    raise
+
+    def lookup_execution(
+        self,
+        plan: MutationBatch,
+        *,
+        expected_pot_id: str,
+        mutation_id: str,
+    ) -> MutationExecutionLookup:
+        if not self.atomic_mutations_supported:
+            lookup = self.execution_registry.lookup(
+                plan, expected_pot_id=expected_pot_id, mutation_id=mutation_id
+            )
+            if lookup.state != MutationExecutionState.absent.value:
+                return lookup
+            return MutationExecutionLookup(
+                MutationExecutionState.unsupported.value,
+                mutation_id,
+                mutation_batch_fingerprint(plan),
+                detail="the injected writer has no authoritative durable receipt lookup",
+            )
+        from potpie_context_engine.adapters.outbound.graph.falkordb_atomic import (
+            lookup_execution,
+        )
+
+        return lookup_execution(
+            self.writer._get_graph(),
+            plan,
+            expected_pot_id=expected_pot_id,
+            mutation_id=mutation_id,
+        )
+
+    async def lookup_execution_async(
+        self,
+        plan: MutationBatch,
+        *,
+        expected_pot_id: str,
+        mutation_id: str,
+    ) -> MutationExecutionLookup:
+        return await asyncio.to_thread(
+            self.lookup_execution,
+            plan,
+            expected_pot_id=expected_pot_id,
+            mutation_id=mutation_id,
+        )
+
+    def apply(
+        self,
+        plan: MutationBatch,
+        *,
+        expected_pot_id: str,
+        provenance_context: ProvenanceContext | None = None,
+        reconciliation_config: ReconciliationConfig | None = None,
+    ) -> MutationResult:
+        return _run_sync(
+            self.apply_async(
+                plan,
+                expected_pot_id=expected_pot_id,
+                provenance_context=provenance_context,
+                reconciliation_config=reconciliation_config,
+            )
+        )
+
+    def invalidate(
+        self, *, pot_id: str, claim_keys: Any, reason: str | None = None
+    ) -> int:
+        if not self.atomic_mutations_supported:
+            raise CapabilityNotImplemented(
+                f"graph.{self.profile}.mutation.invalidate",
+                detail="the injected legacy writer has no atomic mutation surface",
+            )
+        plan = MutationBatch(
+            invalidations=[
+                InvalidationOp(
+                    target_entity_key=None,
+                    target_edge=None,
+                    target_claim_keys=(claim_key,),
+                    reason=reason or "claim invalidated",
+                )
+                for claim_key in claim_keys
+            ]
+        )
+        result = self.apply(
+            plan,
+            expected_pot_id=pot_id,
+            provenance_context=ProvenanceContext(
+                mutation_id=uuid.uuid4().hex,
+                source_event_id=f"invalidation:{uuid.uuid4().hex}",
+            ),
+        )
+        return result.mutation_summary.invalidations_applied
+
+    def reset_pot(
+        self, pot_id: str, *, mutation_id: str | None = None
+    ) -> dict[str, Any]:
+        if not self.atomic_mutations_supported:
+            return _run_sync(self.writer.reset_pot(pot_id))
+        result = self.apply(
+            MutationBatch(reset_pot=True),
+            expected_pot_id=pot_id,
+            provenance_context=ProvenanceContext(
+                mutation_id=mutation_id or uuid.uuid4().hex
+            ),
+        )
+        return {
+            "ok": result.ok,
+            **result.administrative_summary,
+            "version": result.execution.version_after,
+            "mutation_id": result.mutation_id,
+            "execution": result.execution.to_dict(),
+        }
+
+    async def reset_pot_async(
+        self, pot_id: str, *, mutation_id: str | None = None
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self.reset_pot, pot_id, mutation_id=mutation_id)
+
+    def readiness(self, pot_id: str) -> BackendReadiness:
+        driver = _missing_driver_module(self.settings)
+        ready = bool(getattr(self.writer, "enabled", False)) and driver is None
+        if driver is not None:
+            remedy = (
+                _local_extra_next_action()
+                if driver == "redislite"
+                else "install it with `pip install 'potpie-context-engine[local]'`"
+            )
+            detail = (
+                f"{self.profile} is selected but its driver ({driver!r}) is not "
+                f"installed — {remedy}"
+            )
+        elif ready:
+            detail = (
+                f"{self.profile} claim_query + mutation + semantic + analytics + "
+                "inspection + snapshot wired; atomic revision checks and durable "
+                "mutation receipts supported"
+            )
+        else:
+            detail = (
+                f"{self.profile} backend is not configured or context graph is disabled"
+            )
+        return BackendReadiness(
+            profile=self.profile,
+            ready=ready,
+            detail=detail,
+            capability_ready={
+                "mutation": ready,
+                "atomic_mutation": ready and self.atomic_mutations_supported,
+                "claim_query": ready,
+                "analytics": ready,
+                "semantic": ready,
+                "inspection": ready,
+                "snapshot": ready,
+            },
+        )
+
+
+@dataclass(slots=True)
+class FalkorDBGraphBackend:
+    """FalkorDB-backed ``GraphBackend``."""
+
+    settings: Any
+    writer: GraphWriterPort | None = None
+    graph_provider: FalkorDBGraphProvider | None = None
+    embedder: Any = None
+    profile_name: str = _PROFILE
+    force_mode: str | None = None
+    definition: GraphDefinition = DEFAULT_GRAPH_DEFINITION
+    execution_registry: MutationExecutionRegistry = field(
+        default_factory=MutationExecutionRegistry,
+        repr=False,
+    )
+    resource_exists: Any = None
+    _claim_query: ClaimQueryPort = field(init=False)
+    _mutation: _FalkorDBMutation = field(init=False)
+    _semantic: ClaimQuerySemanticSearch = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.force_mode is not None:
+            self.settings = _FalkorDBModeSettings(self.settings, self.force_mode)
+        provider = self.graph_provider or FalkorDBGraphProvider(self.settings)
+        writer = self.writer or FalkorDBGraphWriter(
+            self.settings,
+            graph_provider=provider,
+            embedder=self.embedder,
+            definition=self.definition,
+        )
+        bind_writer = getattr(writer, "bind_definition", None)
+        if callable(bind_writer):
+            writer = bind_writer(self.definition)
+        self.graph_provider = provider
+        self.writer = writer
+        self._claim_query = FalkorDBClaimQueryStore(
+            self.settings, graph_provider=provider, embedder=self.embedder
+        )
+        self._mutation = _FalkorDBMutation(
+            self.settings,
+            writer,
+            profile=self.profile_name,
+            definition=self.definition,
+            execution_registry=self.execution_registry,
+        )
+        self._semantic = ClaimQuerySemanticSearch(self._claim_query)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(getattr(self.writer, "enabled", False))
+
+    @property
+    def profile(self) -> str:
+        return self.profile_name
+
+    @property
+    def journal(self):
+        from potpie_context_engine.adapters.outbound.graph.falkordb_journal import (
+            FalkorJournal,
+        )
+
+        return FalkorJournal(
+            self.graph_provider(),
+            self.definition,
+            profile=self.profile_name,
+            resource_exists=self.resource_exists,
+        )
+
+    @property
+    def claim_query(self) -> ClaimQueryPort:
+        return self._claim_query
+
+    @property
+    def mutation(self) -> _FalkorDBMutation:
+        return self._mutation
+
+    @property
+    def semantic(self) -> ClaimQuerySemanticSearch:
+        return self._semantic
+
+    @property
+    def inspection(self) -> FalkorDBInspection:
+        return FalkorDBInspection(
+            self.settings,
+            graph_provider=self.graph_provider,
+            embedder=self.embedder,
+            claim_query=self._claim_query,
+        )
+
+    @property
+    def analytics(self) -> FalkorDBAnalytics:
+        assert self.graph_provider is not None
+        from potpie_context_engine.adapters.outbound.graph.falkordb_repair import (
+            FalkorDBRepair,
+        )
+
+        return FalkorDBAnalytics(
+            graph_provider=self.graph_provider,
+            fallback=FalkorDBRepair(
+                self._claim_query, self.graph_provider, self.mutation, self.definition
+            ),
+        )
+
+    @property
+    def snapshot(self) -> Any:
+        from potpie_context_engine.adapters.outbound.graph.falkordb_snapshot import (
+            FalkorDBSnapshot,
+        )
+
+        return FalkorDBSnapshot(self.graph_provider, self.mutation)
+
+    def capabilities(self) -> BackendCapabilities:
+        return BackendCapabilities(
+            profile=self.profile_name,
+            mutation=True,
+            claim_query=True,
+            analytics=True,
+            semantic=True,
+            inspection=True,
+            snapshot=True,
+        )
+
+    def bind_definition(self, definition: GraphDefinition) -> FalkorDBGraphBackend:
+        return replace(self, definition=definition)
+
+    def provision(self) -> BackendProvisionResult:
+        if not self.enabled:
+            return BackendProvisionResult(
+                ok=False,
+                detail=f"{self.profile_name} backend is not configured or context graph is disabled",
+                metadata={"profile": self.profile_name},
+            )
+        try:
+            ok = bool(_run_sync(self.writer.ensure_indexes()))
+        except Exception as exc:  # noqa: BLE001
+            return BackendProvisionResult(
+                ok=False,
+                detail=str(exc),
+                metadata={"profile": self.profile_name},
+            )
+        return BackendProvisionResult(
+            ok=ok,
+            detail=(
+                f"{self.profile_name} backend ready"
+                if ok
+                else f"{self.profile_name} index setup failed"
+            ),
+            metadata={"profile": self.profile_name},
+        )
+
+
+class FalkorDBLiteGraphBackend(FalkorDBGraphBackend):
+    """FalkorDBLite-backed profile using the same Falkor adapter bundle."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("profile_name", _LITE_PROFILE)
+        kwargs.setdefault("force_mode", "lite")
+        super().__init__(*args, **kwargs)
+
+
+__all__ = ["FalkorDBGraphBackend", "FalkorDBLiteGraphBackend"]

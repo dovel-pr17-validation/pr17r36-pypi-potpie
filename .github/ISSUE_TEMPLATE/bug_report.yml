@@ -1,0 +1,120 @@
+name: Bug Report
+description: Report a problem with the Potpie CLI or local context graph
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please include the command or workflow that failed and the output you saw.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the current Potpie CLI is affected?
+      options:
+        - Install or upgrade
+        - Setup wizard (potpie setup)
+        - Login or auth
+        - Integration auth/status
+        - Daemon or local services
+        - Pot/source registration
+        - Context graph, resolve, or search
+        - Agent skills or harness setup
+        - Web UI (potpie ui)
+        - Packaging or release
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Potpie version
+      description: Run `potpie --version` if the CLI starts. If not, say that here.
+      placeholder: "potpie 2.0.0b3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_source
+    attributes:
+      label: Install source
+      description: How are you running Potpie locally?
+      options:
+        - uv tool install potpie (no extras)
+        - uv tool install with extras, e.g. 'potpie[all]'
+        - pip or pipx from PyPI
+        - Source checkout
+        - Editable/local build
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: Share your operating system and Python version.
+      placeholder: "macOS 15.5, Python 3.13.5"
+    validations:
+      required: true
+
+  - type: input
+    id: agent_model
+    attributes:
+      label: Coding agent and model
+      description: If a coding agent was involved, tell us which one and which model it used.
+      placeholder: "Codex with GPT-5, Claude Code with Sonnet, Cursor, OpenCode, etc."
+    validations:
+      required: false
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Command or workflow
+      description: What command or CLI workflow were you running?
+      placeholder: |
+        potpie setup --repo . --agent claude
+        potpie status
+        potpie graph status --json
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Describe what failed or looked wrong. Include what you expected if it is not obvious.
+      placeholder: "The command failed with ..., but I expected ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: source_details
+    attributes:
+      label: Source or build details
+      description: If you are using a source checkout or editable build, share the branch, commit, package manager, and relevant local changes.
+      placeholder: |
+        branch:
+        commit:
+        package manager:
+        local changes:
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or logs
+      description: |
+        Paste the relevant command output, error message, or stack trace.
+        Wrap code blocks with triple backticks (```).
+      placeholder: |
+        ```
+        Paste output here
+        ```
+      render: shell
+    validations:
+      required: false

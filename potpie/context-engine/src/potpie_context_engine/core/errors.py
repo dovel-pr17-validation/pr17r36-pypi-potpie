@@ -1,0 +1,171 @@
+"""Domain-level errors; translate to HTTP/CLI at adapter boundaries."""
+
+
+class ContextEngineError(Exception):
+    """Base for all context-engine domain errors."""
+
+
+class GraphMutationVersionConflict(ContextEngineError):
+    """Atomic compare-and-apply observed a newer canonical graph revision."""
+
+    def __init__(self, *, expected: int, current: int):
+        super().__init__(f"graph version moved from {expected} to {current}")
+        self.expected = expected
+        self.current = current
+
+
+class ContextEngineDisabled(ContextEngineError):
+    """Feature flag off or graph clients unavailable."""
+
+
+class GraphSubstrateUnavailable(ContextEngineDisabled):
+    """The graph store cannot be trusted to answer, so it must not answer.
+
+    Distinct from "the backend is down": the store here is *reachable* and will
+    happily serve a dataset that may be missing recent writes — the worst
+    outcome for a memory product, because the answer looks complete. Raised
+    instead of opening the store, and carries the operator's recovery step so
+    the CLI's error contract can print something actionable rather than a
+    generic unavailability message.
+    """
+
+    def __init__(self, message: str, *, recommended_next_action: str | None = None):
+        super().__init__(message)
+        self.recommended_next_action = recommended_next_action
+
+
+class PotTeardownFailed(ContextEngineDisabled):
+    """A pot's graph wipe did not happen, so the rest of the teardown must not.
+
+    Tearing a pot down destroys two stores, and only one order is safe: the
+    resource tree may go once the claims citing its chunks are gone. Mutation
+    adapters report an unreachable store by *returning* ``{"ok": False,
+    "error": ...}`` rather than raising, so a caller that ignores the return
+    purges the chunk files anyway and leaves the pot worse than it found it —
+    live claims whose evidence no longer exists — while reporting success.
+    Raised instead of continuing, carrying the adapter's own error text so the
+    CLI's unavailability contract prints what actually failed.
+    """
+
+    def __init__(self, message: str, *, recommended_next_action: str | None = None):
+        super().__init__(message)
+        self.recommended_next_action = recommended_next_action
+
+
+class AlreadyIngested(ContextEngineError):
+    """Source was already recorded in the ingestion ledger."""
+
+
+class UpstreamError(ContextEngineError):
+    """External dependency failed (GitHub, Neo4j, Postgres)."""
+
+
+class BridgeError(ContextEngineError):
+    """Failed to write structural graph bridges."""
+
+
+class PotNotFound(ContextEngineError):
+    """Host could not resolve pot_id."""
+
+
+class SourceNotFound(PotNotFound):
+    """The pot resolved; the source id it was asked about is not in it.
+
+    The wrong noun is the whole defect. ``source status src-typo`` raised
+    ``PotNotFound``, so the CLI reported ``pot_not_found`` and told the operator
+    to run ``pot list`` — a repair that cannot succeed, because no pot is
+    missing. The registration is usually alive in the pot they did not pass, and
+    the listing that would show them is ``source list``.
+
+    Subclassing :class:`PotNotFound` is deliberate: an inbound boundary that has
+    not learned this type yet still renders a sensible refusal carrying
+    ``recommended_next_action`` rather than collapsing it into "unexpected
+    internal error". Boundaries that have learned it report ``source_not_found``.
+    """
+
+    def __init__(self, message: str, *, recommended_next_action: str | None = None):
+        super().__init__(message)
+        self.recommended_next_action = recommended_next_action
+
+
+class PotArchived(ContextEngineError):
+    """The ref names a pot, but that pot is archived.
+
+    Distinct from :class:`PotNotFound` because the repair differs: an unknown
+    ref is a typo, while this one resolved. The pot shows under
+    ``pot list --archived`` and archiving cleared its graph state and stored
+    documents, so selecting it, writing to it, or routing a repo into it can
+    only produce empty answers.
+    """
+
+    def __init__(self, message: str, *, recommended_next_action: str | None = None):
+        super().__init__(message)
+        self.recommended_next_action = recommended_next_action
+
+
+class PotNameConflict(ContextEngineError):
+    """A pot name is already taken by another live pot, or shadows a pot id.
+
+    Refs resolve against ids and names, so two pots sharing a name make every
+    bare ref (including ``pot reset <name>``) pick an arbitrary one, and a name
+    equal to another pot's id makes that pot unreachable by name.
+    """
+
+    def __init__(self, message: str, *, recommended_next_action: str | None = None):
+        super().__init__(message)
+        self.recommended_next_action = recommended_next_action
+
+
+class MutationBatchValidationError(ContextEngineError):
+    """A :class:`~potpie_context_engine.core.reconciliation.MutationBatch` failed structural validation.
+
+    When validation is driven by ontology checks, ``structured_issues`` carries
+    ``{"entity", "issue"}`` rows aligned with :func:`potpie_context_engine.core.reconciliation_issues.validation_lines_to_issues`.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        structured_issues: tuple[dict[str, str], ...] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.structured_issues = structured_issues or ()
+
+
+# Back-compat alias (Step 5a rename).
+
+
+class ReconciliationApplyError(ContextEngineError):
+    """Deterministic apply step failed after validation."""
+
+
+class CapabilityNotImplemented(ContextEngineError):
+    """A port/capability is wired into the skeleton but has no real
+    implementation yet.
+
+    The architectural skeleton wires *every* Protocol to at least a dummy
+    adapter, so no public surface dead-ends in a bare ``NotImplementedError``.
+    When an inbound adapter hits an unbuilt capability it catches this and
+    renders the structured not-implemented contract (CLI exit ``2``/``3``,
+    ``context_status`` ``not_implemented``, JSON ``code``/``message``/
+    ``recommended_next_action``) instead of a traceback.
+
+    ``capability`` is a dotted slot name (e.g. ``graph.inspection.path``) so
+    logs/telemetry can attribute the gap to a specific boundary.
+    """
+
+    def __init__(
+        self,
+        capability: str,
+        *,
+        detail: str | None = None,
+        recommended_next_action: str | None = None,
+    ) -> None:
+        self.capability = capability
+        self.detail = detail
+        self.recommended_next_action = recommended_next_action
+        message = f"Capability not implemented: {capability}"
+        if detail:
+            message = f"{message} — {detail}"
+        super().__init__(message)

@@ -1,0 +1,205 @@
+"""``SkillManager`` service port.
+
+Skills are CLI-managed recipes that teach an agent harness how to use the
+``potpie`` CLI and the four context tools. They are **not** graph facts and
+**not** new agent tools. Agents only ever see an advisory ``skills`` block
+(``SkillNudge``) inside ``context_status`` listing missing/outdated skills and
+the exact install command — installation is a human/CLI action.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Protocol
+
+# SkillNudge is the advisory block embedded in context_status; it is defined
+# in the agent contract module to keep the ports layer acyclic and re-exported
+# here so skill code can import it from its own service module.
+from potpie_context_engine.core.ports.agent_context import SkillNudge
+
+
+@dataclass(frozen=True, slots=True)
+class SkillInfo:
+    """One skill in the catalog or installed for an agent."""
+
+    id: str
+    title: str
+    version: str
+    description: str = ""
+    installed: bool = False
+    installed_version: str | None = None
+    #: Installed, but its files no longer match what the bundle carries — a
+    #: hand-edit or a half-written install. Distinct from an outdated
+    #: ``installed_version``, which a version comparison can already see.
+    drifted: bool = False
+    disabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SkillStatus:
+    """Per-agent installed-vs-recommended drift for ``skills status``."""
+
+    agent: str
+    installed: tuple[SkillInfo, ...] = ()
+    missing: tuple[SkillInfo, ...] = ()
+    outdated: tuple[SkillInfo, ...] = ()
+    disabled: tuple[SkillInfo, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SkillOperationResult:
+    """Outcome of an install/update/remove/add operation."""
+
+    agent: str
+    operation: str
+    changed: tuple[str, ...] = ()
+    detail: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+class AgentTargetPort(Protocol):
+    """Harness-specific install target (e.g. Claude ``.claude/`` bundle).
+
+    The extension seam for supporting a new agent harness: implement this port
+    and register it with the ``SkillManager``. The manager owns catalog/drift
+    logic; the target owns where/how files land for one harness.
+    """
+
+    @property
+    def agent(self) -> str: ...
+
+    def installed(self) -> Mapping[str, str]:
+        """Installed skill id -> version for this harness."""
+        ...
+
+    def available(self) -> frozenset[str]:
+        """Catalog ids this harness's bundle can actually install.
+
+        Optional, like ``matches_bundle``: a target that does not implement it
+        is taken to carry whatever the catalog lists. Implementing it is what
+        keeps "in the catalog" from being read as "installable here" for a
+        harness whose bundle carries fewer skills than the catalog; without it
+        the manager would report a skill it could never write as changed on
+        every run. The manager asks it *before* the catalog, so it answers only
+        about ids the catalog has; an unknown id is the catalog's refusal to
+        make, not this one's.
+        """
+        ...
+
+    def matches_bundle(self, *, skill_id: str, path: str | None = None) -> bool:
+        """Is the installed skill byte-identical to what ``install`` would write?
+
+        Optional: the manager treats a target that does not implement it as
+        "current", because reinstalling on every command is a worse default than
+        missing drift on a third-party target. Implementations should answer by
+        dry-running their own install rather than by comparing a recorded
+        version — a version integer cannot see a truncated or edited file.
+        """
+        ...
+
+    def locally_modified(self, *, skill_id: str) -> bool:
+        """Whether the installed file differs from the last content we wrote."""
+        ...
+
+    def disabled(self) -> frozenset[str]:
+        """Skill ids intentionally removed from bundle sweeps."""
+        ...
+
+    def set_disabled(self, *, skill_id: str, disabled: bool) -> None: ...
+
+    def install(
+        self, *, skill_id: str, version: str, path: str | None = None
+    ) -> None: ...
+
+    def remove(self, *, skill_id: str) -> None: ...
+
+    def install_instructions(self, *, path: str | None = None) -> Any:
+        """Merge the routing block into the harness's instruction file.
+
+        Optional, and separate from ``install`` because the block belongs to
+        the bundle rather than to any one skill id: only a sweep writes it, and
+        the result names the file so a command cannot edit a user-authored
+        ``CLAUDE.md`` without saying so. The result may also carry ``removed``
+        and ``leftovers``: files an earlier release installed that the sweep
+        deleted, or left in place with a next action.
+        """
+        ...
+
+    def remove_instructions(self, *, path: str | None = None) -> Any:
+        """Strip that block back out; the mirror of the method above.
+
+        Also optional — but a target that implements one and not the other is
+        a target whose ``remove --all`` leaves the harness loading Potpie's
+        instruction file after every skill it refers to is gone.
+        """
+        ...
+
+
+class SkillManager(Protocol):
+    """CLI-managed skill catalog and per-agent installation layer."""
+
+    def list(
+        self, *, agent: str = "claude", scope: str = "global", path: str | None = None
+    ) -> list[SkillInfo]:
+        """All catalog skills (with installed/version state when known)."""
+        ...
+
+    def install(
+        self,
+        *,
+        agent: str,
+        skill_id: str | None = None,
+        path: str | None = None,
+        scope: str = "global",
+    ) -> SkillOperationResult:
+        """Install one skill (or the full recommended set when ``skill_id`` is
+        ``None``) for an agent harness."""
+        ...
+
+    def update(
+        self,
+        *,
+        agent: str,
+        skill_id: str | None = None,
+        all_: bool = False,
+        path: str | None = None,
+        scope: str = "global",
+    ) -> SkillOperationResult:
+        """Update an installed skill, or all of them when ``all_``."""
+        ...
+
+    def remove(
+        self,
+        *,
+        agent: str,
+        skill_id: str | None = None,
+        all_: bool = False,
+        path: str | None = None,
+        scope: str = "global",
+    ) -> SkillOperationResult:
+        """Remove one installed skill, or all installed skills when ``all_``."""
+        ...
+
+    def status(
+        self, *, agent: str, path: str | None = None, scope: str = "global"
+    ) -> SkillStatus:
+        """Installed-vs-recommended drift for one agent."""
+        ...
+
+    def nudge(self, *, agent: str) -> SkillNudge:
+        """The advisory block ``context_status`` embeds for an agent."""
+        ...
+
+    def add(self, *, source: str) -> SkillOperationResult:
+        """Register a local-path or URL skill into the catalog."""
+        ...
+
+
+__all__ = [
+    "AgentTargetPort",
+    "SkillInfo",
+    "SkillManager",
+    "SkillNudge",
+    "SkillOperationResult",
+    "SkillStatus",
+]

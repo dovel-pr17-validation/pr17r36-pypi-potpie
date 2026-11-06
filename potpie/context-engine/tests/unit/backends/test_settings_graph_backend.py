@@ -1,0 +1,127 @@
+"""Unit tests for the GRAPH_DB_BACKEND + FalkorDB settings accessors.
+
+Covers default (neo4j), backend selection, and the
+``CONTEXT_ENGINE_*`` → bare-env fallback precedence.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+from potpie_context_engine.adapters.outbound.settings_env import (
+    EnvContextEngineSettings,
+)
+
+pytestmark = pytest.mark.unit
+
+
+def _clear(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in (
+        "GRAPH_DB_BACKEND",
+        "CONTEXT_ENGINE_FALKORDB_URL",
+        "FALKORDB_URL",
+        "CONTEXT_ENGINE_FALKORDB_GRAPH_NAME",
+        "FALKORDB_GRAPH_NAME",
+        "CONTEXT_ENGINE_FALKORDB_MODE",
+        "FALKORDB_MODE",
+        "CONTEXT_ENGINE_FALKORDB_LITE_PATH",
+        "FALKORDB_LITE_PATH",
+        "CONTEXT_ENGINE_LADYBUG_PATH",
+        "LADYBUG_PATH",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_backend_defaults_to_neo4j(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    assert EnvContextEngineSettings().graph_db_backend() == "neo4j"
+
+
+def test_backend_falkordb_lowercased(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("GRAPH_DB_BACKEND", "FalkorDB")
+    assert EnvContextEngineSettings().graph_db_backend() == "falkordb"
+
+
+def test_falkordb_url_none_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    assert EnvContextEngineSettings().falkordb_url() is None
+
+
+def test_falkordb_url_context_engine_overrides_bare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("FALKORDB_URL", "redis://bare:6379")
+    monkeypatch.setenv("CONTEXT_ENGINE_FALKORDB_URL", "redis://dedicated:6379")
+    assert EnvContextEngineSettings().falkordb_url() == "redis://dedicated:6379"
+
+
+def test_falkordb_url_falls_back_to_bare(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("FALKORDB_URL", "redis://bare:6379")
+    assert EnvContextEngineSettings().falkordb_url() == "redis://bare:6379"
+
+
+def test_graph_name_default_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    assert EnvContextEngineSettings().falkordb_graph_name() == "context_graph"
+    monkeypatch.setenv("FALKORDB_GRAPH_NAME", "my_graph")
+    assert EnvContextEngineSettings().falkordb_graph_name() == "my_graph"
+
+
+def test_mode_default_lite_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    assert EnvContextEngineSettings().falkordb_mode() == "lite"
+    monkeypatch.setenv("FALKORDB_MODE", "SERVER")
+    assert EnvContextEngineSettings().falkordb_mode() == "server"
+
+
+def test_lite_path_default_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.delenv("CONTEXT_ENGINE_HOME", raising=False)
+    # Default is home-rooted and absolute: a relative path would resolve
+    # against the daemon's cwd (e.g. site-packages for an installed CLI).
+    default = EnvContextEngineSettings().falkordb_lite_path()
+    assert default == str(Path.home() / ".potpie" / "context_graph" / "falkordb.db")
+    monkeypatch.setenv("CONTEXT_ENGINE_HOME", "/srv/potpie-home")
+    assert EnvContextEngineSettings().falkordb_lite_path() == str(
+        Path("/srv/potpie-home") / "context_graph" / "falkordb.db"
+    )
+    monkeypatch.setenv("FALKORDB_LITE_PATH", "/tmp/cg.db")
+    assert EnvContextEngineSettings().falkordb_lite_path() == "/tmp/cg.db"
+
+
+def test_ladybug_path_default_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.delenv("CONTEXT_ENGINE_HOME", raising=False)
+    settings = EnvContextEngineSettings()
+    assert settings.ladybug_path() == str(
+        Path.home() / ".potpie" / "context_graph" / "ladybug.db"
+    )
+    monkeypatch.setenv("CONTEXT_ENGINE_HOME", str(Path.home() / "test-potpie"))
+    assert settings.ladybug_path() == str(
+        Path.home() / "test-potpie" / "context_graph" / "ladybug.db"
+    )
+    monkeypatch.setenv("LADYBUG_PATH", "bare.db")
+    assert settings.ladybug_path() == "bare.db"
+    monkeypatch.setenv("CONTEXT_ENGINE_LADYBUG_PATH", "dedicated.db")
+    assert settings.ladybug_path() == "dedicated.db"
+    monkeypatch.setenv("CONTEXT_ENGINE_LADYBUG_PATH", "  ")
+    assert settings.ladybug_path() == "bare.db"
+
+
+def test_suite_never_resolves_the_developers_real_home() -> None:
+    """The conftest pin is load-bearing, so assert it rather than trust it.
+
+    Any test that builds a backend without naming a path inherits
+    ``CONTEXT_ENGINE_HOME``; unset, that is the developer's live ``~/.potpie``,
+    and the backend will spawn a server against the real graph and mutate it.
+    This failing is the signal that the autouse fixture was removed or shadowed.
+    """
+    home = os.environ.get("CONTEXT_ENGINE_HOME")
+    assert home, "the autouse _isolated_home fixture must pin CONTEXT_ENGINE_HOME"
+    assert Path(home).resolve() != (Path.home() / ".potpie").resolve()

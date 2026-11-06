@@ -1,0 +1,78 @@
+name: Feature Request
+description: Suggest an improvement to the Potpie CLI or context graph workflow
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please describe the CLI workflow you want to make better.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of Potpie would this affect?
+      options:
+        - Install or upgrade
+        - Setup wizard (potpie setup)
+        - Login or auth
+        - Integrations
+        - Daemon or local services
+        - Pot/source management
+        - Context graph, resolve, or search
+        - Agent skills or harness setup
+        - Web UI (potpie ui)
+        - Packaging or release
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: agent_model
+    attributes:
+      label: Coding agent and model
+      description: If this request depends on a coding agent, tell us which agent and model should be supported.
+      placeholder: "Codex with GPT-5, Claude Code with Sonnet, Cursor, OpenCode, etc."
+    validations:
+      required: false
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow
+      description: What is hard, missing, confusing, or repetitive today?
+      placeholder: |
+        Describe the workflow, missing capability, or friction.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Desired behavior
+      description: What should Potpie do instead?
+      placeholder: |
+        Describe the command, flag, behavior, integration, or UI change you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Example workflow
+      description: Show what using this would look like, if you can.
+      placeholder: |
+        potpie ...
+        potpie graph ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Anything else that would help us evaluate this request
+      placeholder: Links, examples, related issues, or constraints.
+    validations:
+      required: false

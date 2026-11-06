@@ -1,0 +1,522 @@
+"""Unit tests for the FalkorDB ClaimQueryPort adapter.
+
+No live FalkorDB: an injected fake graph returns canned ``result_set`` rows so
+we exercise param-building, row parsing (reusing ``_row_from_record``), the
+fact_query token-overlap stamping + ordering, limit truncation, and
+``entity_labels`` — mirroring ``test_neo4j_claim_query`` for parity.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+from potpie_context_engine.core.ports.claim_query import ClaimQueryFilter
+
+from potpie_context_engine.adapters.outbound.graph.falkordb_reader import (
+    FalkorDBClaimQueryStore,
+)
+
+
+pytestmark = pytest.mark.unit
+
+
+class _FakeResult:
+    def __init__(self, header, result_set):
+        self.header = header
+        self.result_set = result_set
+
+
+class _FakeGraph:
+    def __init__(self, header, result_set):
+        self._header = header
+        self._result_set = result_set
+        self.captured: list[tuple[str, dict]] = []
+
+    def query(self, cypher, params=None):
+        self.captured.append((cypher, params or {}))
+        return _FakeResult(self._header, self._result_set)
+
+
+def _props_graph(*prop_dicts):
+    return _FakeGraph(header=[[1, "props"]], result_set=[[p] for p in prop_dicts])
+
+
+class _FakeEmbedder:
+    name = "fake-embedder"
+    dimensions = 3
+
+    def embed(self, text: str) -> tuple[float, ...]:
+        return (0.1, 0.2, 0.3)
+
+    def embed_many(self, texts):
+        return [self.embed(t) for t in texts]
+
+
+class _FailingEmbedder:
+    name = "failing-embedder"
+    dimensions = 384
+
+    def embed(self, text: str) -> tuple[float, ...]:
+        raise RuntimeError("model unavailable")
+
+    def embed_many(self, texts):
+        raise RuntimeError("model unavailable")
+
+
+def test_find_claims_builds_params_and_parses_rows() -> None:
+    graph = _props_graph(
+        {
+            "group_id": "p1",
+            "name": "DEPENDS_ON",
+            "subject_key": "service:web",
+            "object_key": "service:auth",
+            "valid_at": "2026-02-01T00:00:00+00:00",
+            "evidence_strength": "attested",
+        }
+    )
+    store = FalkorDBClaimQueryStore(settings=object(), graph=graph)  # type: ignore[arg-type]
+    rows = store.find_claims(
+        ClaimQueryFilter(
+            pot_id="p1",
+            predicate_in=("DEPENDS_ON",),
+            as_of=datetime(2026, 3, 1, tzinfo=timezone.utc),
+            limit=10,
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].predicate == "DEPENDS_ON"
+    assert rows[0].subject_key == "service:web"
+    _, params = graph.captured[0]
+    assert params["gid"] == "p1"
+    assert params["preds"] == ["DEPENDS_ON"]
+    assert params["include_invalid"] is True  # validity is checked after hydration
+    assert params["as_of"] == "2026-03-01T00:00:00+00:00"
+
+
+def test_public_readers_hide_snapshot_encoding_metadata() -> None:
+    claim_graph = _props_graph(
+        {
+            "group_id": "p1",
+            "name": "USES",
+            "subject_key": "a",
+            "object_key": "b",
+            "__potpie_snapshot_properties_v2": '{"nested":"{\\"x\\":1}"}',
+        }
+    )
+    claims = FalkorDBClaimQueryStore(settings=object(), graph=claim_graph)  # type: ignore[arg-type]
+    row = claims.find_claims(ClaimQueryFilter(pot_id="p1"))[0]
+    assert "__potpie_snapshot_properties_v2" not in row.properties
+
+    entity_graph = _props_graph(
+        {"name": "A", "__potpie_snapshot_properties_v2": '{"nested":"{}"}'}
+    )
+    entities = FalkorDBClaimQueryStore(settings=object(), graph=entity_graph)  # type: ignore[arg-type]
+    assert entities.entity_properties(pot_id="p1", entity_key="a") == {"name": "A"}
+
+
+def test_find_claims_hydrates_v15_metadata_from_rows() -> None:
+    graph = _props_graph(
+        {
+            "group_id": "p1",
+            "name": "DEPLOYED_TO",
+            "subject_key": "service:web",
+            "object_key": "environment:prod",
+            "valid_at": "2026-02-01T00:00:00+00:00",
+            "valid_until": "2026-05-01T00:00:00+00:00",
+            "claim_key": "claim:p1:deploy:web:prod",
+            "subgraph": "infra_topology",
+            "truth": "source_observation",
+            "confidence": 1.0,
+            "description": "web is deployed to prod",
+            "environment": "prod",
+            "observed_at": "2026-02-02T00:00:00+00:00",
+            "mutation_id": "mut-2",
+            "source_refs": ["repo:x:k8s.yaml"],
+            "evidence": [
+                {"source_ref": "repo:x:k8s.yaml", "authority": "repository_metadata"}
+            ],
+            "graph_contract_version": "1.5",
+            "ontology_version": "2026-06-01",
+            "source_system": "kubernetes",
+            "source_ref": "repo:x:k8s.yaml",
+            "fact": "web is deployed to prod",
+            "code_scope": {"service": "web"},
+        }
+    )
+    store = FalkorDBClaimQueryStore(settings=object(), graph=graph)  # type: ignore[arg-type]
+
+    row = store.find_claims(
+        ClaimQueryFilter(
+            pot_id="p1",
+            predicate_in=("DEPLOYED_TO",),
+            as_of=datetime(2026, 3, 1, tzinfo=timezone.utc),
+            limit=1,
+        )
+    )[0]
+
+    assert row.claim_key == "claim:p1:deploy:web:prod"
+    assert row.subgraph == "infra_topology"
+    assert row.truth == "source_observation"
+    assert row.evidence_strength == "deterministic"
+    assert row.environment == "prod"
+    assert row.valid_until == datetime(2026, 5, 1, tzinfo=timezone.utc)
+    assert row.source_refs == ("repo:x:k8s.yaml",)
+    assert row.evidence == (
+        {"source_ref": "repo:x:k8s.yaml", "authority": "repository_metadata"},
+    )
+    assert row.graph_contract_version == "1.5"
+    assert row.ontology_version == "2026-06-01"
+    assert "truth" not in row.properties
+    assert "environment" not in row.properties
+    assert row.properties["code_scope"] == {"service": "web"}
+
+
+def test_fact_query_stamps_similarity_and_orders() -> None:
+    graph = _props_graph(
+        {
+            "group_id": "p1",
+            "name": "X",
+            "subject_key": "a",
+            "object_key": "b",
+            "fact": "connection pool exhausted in checkout",
+        },
+        {
+            "group_id": "p1",
+            "name": "X",
+            "subject_key": "c",
+            "object_key": "d",
+            "fact": "unrelated note about logging",
+        },
+    )
+    store = FalkorDBClaimQueryStore(settings=object(), graph=graph)  # type: ignore[arg-type]
+    rows = store.find_claims(
+        ClaimQueryFilter(pot_id="p1", fact_query="connection pool exhausted")
+    )
+    assert rows[0].subject_key == "a"
+    assert (
+        rows[0].properties["semantic_similarity"]
+        > rows[1].properties["semantic_similarity"]
+    )
+
+
+def test_fact_query_uses_native_relationship_vector_index_when_embedder_present() -> (
+    None
+):
+    graph = _DispatchGraph(
+        vector_rows=[
+            [
+                {
+                    "group_id": "p1",
+                    "name": "X",
+                    "subject_key": "a",
+                    "object_key": "b",
+                    "fact": "connection pool exhausted in checkout",
+                },
+                0.12,
+            ]
+        ],
+        label_rows=[["a", ["Entity"]], ["b", ["Entity"]]],
+    )
+    store = FalkorDBClaimQueryStore(
+        settings=object(), graph=graph, embedder=_FakeEmbedder()
+    )  # type: ignore[arg-type]
+
+    rows = store.find_claims(
+        ClaimQueryFilter(pot_id="p1", fact_query="connection pool exhausted", limit=3)
+    )
+
+    cypher, params = graph.captured[0]
+    assert "db.idx.vector.queryRelationships" in cypher
+    assert "vecf32($embedding)" in cypher
+    # Endpoint-free: no per-hit re-MATCH join, no labels() access, and the
+    # embedding is nulled out of the returned props.
+    assert "MATCH" not in cypher
+    assert "labels(" not in cypher
+    assert "fact_embedding: NULL" in cypher
+    assert "ORDER BY score ASC" in cypher
+    assert params["embedding"] == [0.1, 0.2, 0.3]
+    assert params["k"] == 50
+    assert "LIMIT" not in cypher
+    assert rows[0].subject_key == "a"
+    assert rows[0].properties["semantic_similarity"] == pytest.approx(0.88)
+
+
+def test_fact_query_falls_back_to_lexical_when_embedder_fails() -> None:
+    graph = _props_graph(
+        {
+            "group_id": "p1",
+            "name": "X",
+            "subject_key": "a",
+            "object_key": "b",
+            "fact": "connection pool exhausted in checkout",
+        },
+        {
+            "group_id": "p1",
+            "name": "X",
+            "subject_key": "c",
+            "object_key": "d",
+            "fact": "unrelated note about logging",
+        },
+    )
+    store = FalkorDBClaimQueryStore(
+        settings=object(), graph=graph, embedder=_FailingEmbedder()
+    )  # type: ignore[arg-type]
+
+    rows = store.find_claims(
+        ClaimQueryFilter(pot_id="p1", fact_query="connection pool exhausted")
+    )
+
+    assert "db.idx.vector.queryRelationships" not in graph.captured[0][0]
+    assert rows[0].subject_key == "a"
+    assert rows[0].properties["semantic_similarity"] > 0
+
+
+def test_limit_truncates() -> None:
+    graph = _props_graph(
+        *[
+            {"group_id": "p1", "name": "X", "subject_key": str(i), "object_key": "o"}
+            for i in range(5)
+        ]
+    )
+    store = FalkorDBClaimQueryStore(settings=object(), graph=graph)  # type: ignore[arg-type]
+    rows = store.find_claims(
+        ClaimQueryFilter(pot_id="p1", predicate_in=("X",), limit=2)
+    )
+    assert len(rows) == 2
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "subject_key",
+        "object_key",
+        "claim_key",
+        "fact",
+        "description",
+        "source_ref",
+        "source_refs",
+    ),
+)
+@pytest.mark.parametrize("vector", (False, True))
+def test_exact_identity_filters_hydrated_rows_before_limit(field, vector) -> None:
+    props = [
+        {
+            "group_id": "p1",
+            "name": "TOUCHED",
+            "subject_key": "unrelated",
+            "object_key": "repo:example",
+        },
+        {
+            "group_id": "p1",
+            "name": "TOUCHED",
+            "subject_key": "matched",
+            "object_key": "repo:example",
+            field: ["https://github.com/acme/example/pull/1"]
+            if field == "source_refs"
+            else "PR-1",
+        },
+    ]
+    graph = (
+        _DispatchGraph(
+            [[row, i / 10] for i, row in enumerate(props)],
+            [[row["subject_key"], ["Entity"]] for row in props]
+            + [[row["object_key"], ["Entity"]] for row in props],
+        )
+        if vector
+        else _props_graph(*props)
+    )
+    store = FalkorDBClaimQueryStore(
+        settings=object(), graph=graph, embedder=_FakeEmbedder() if vector else None
+    )  # type: ignore[arg-type]
+    rows = store.find_claims(
+        ClaimQueryFilter(
+            pot_id="p1",
+            fact_query="match" if vector else None,
+            exact_text_in=("pr-1", "/pull/1"),
+            limit=1,
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].subject_key == props[1]["subject_key"]
+    assert graph.captured[0][1]["exact_text"] is None
+
+
+class _DispatchGraph:
+    """Fake graph that answers vector and entity-label queries differently."""
+
+    def __init__(self, vector_rows, label_rows):
+        self._vector_rows = vector_rows
+        self._label_rows = label_rows
+        self.captured: list[tuple[str, dict]] = []
+
+    def query(self, cypher, params=None):
+        self.captured.append((cypher, params or {}))
+        if "db.idx.vector.queryRelationships" in cypher:
+            return _FakeResult([[1, "props"], [1, "score"]], self._vector_rows)
+        return _FakeResult([[1, "key"], [1, "labels"]], self._label_rows)
+
+
+def test_fact_query_applies_label_filters_in_python() -> None:
+    vector_rows = [
+        [
+            {
+                "group_id": "p1",
+                "name": "X",
+                "subject_key": "service:web",
+                "object_key": "team:platform",
+                "fact": "match",
+            },
+            0.1,
+        ],
+        [
+            {
+                "group_id": "p1",
+                "name": "X",
+                "subject_key": "doc:readme",
+                "object_key": "team:platform",
+                "fact": "match",
+            },
+            0.2,
+        ],
+    ]
+    label_rows = [
+        ["service:web", ["Entity", "Service"]],
+        ["doc:readme", ["Entity", "Document"]],
+        ["team:platform", ["Entity", "Team"]],
+    ]
+    graph = _DispatchGraph(vector_rows, label_rows)
+    store = FalkorDBClaimQueryStore(
+        settings=object(), graph=graph, embedder=_FakeEmbedder()
+    )  # type: ignore[arg-type]
+
+    rows = store.find_claims(
+        ClaimQueryFilter(
+            pot_id="p1",
+            fact_query="match",
+            subject_label="Service",
+            limit=5,
+        )
+    )
+
+    assert [r.subject_key for r in rows] == ["service:web"]
+    vector_cypher, vector_params = graph.captured[0]
+    assert "labels(" not in vector_cypher
+    # With a label filter pending in Python, the query keeps the whole
+    # candidate set instead of pre-trimming to the requested limit.
+    assert "LIMIT" not in vector_cypher
+
+
+def test_fact_query_vector_result_clamped_to_limit() -> None:
+    vector_rows = [
+        [
+            {
+                "group_id": "p1",
+                "name": "X",
+                "subject_key": f"s{i}",
+                "object_key": "o",
+                "fact": "match",
+            },
+            0.1 * i,
+        ]
+        for i in range(5)
+    ]
+    graph = _DispatchGraph(
+        vector_rows,
+        [[f"s{i}", ["Entity"]] for i in range(5)] + [["o", ["Entity"]]],
+    )
+    store = FalkorDBClaimQueryStore(
+        settings=object(), graph=graph, embedder=_FakeEmbedder()
+    )  # type: ignore[arg-type]
+
+    rows = store.find_claims(ClaimQueryFilter(pot_id="p1", fact_query="match", limit=2))
+
+    assert len(rows) == 2
+
+
+@pytest.mark.parametrize("vector", (False, True))
+def test_offset_validity_filters_before_limit(vector) -> None:
+    props = [
+        {
+            "group_id": "p1",
+            "name": "USES",
+            "subject_key": key,
+            "object_key": "o",
+            "valid_from": "2026-02-28T17:30:00-05:30",
+            **validity,
+        }
+        for key, validity in (
+            ("expired", {"invalid_at": "2026-03-01T04:00:00+05:30"}),
+            ("current", {"invalid_at": "2026-02-28T20:00:00-05:30"}),
+            ("future", {"valid_from": "2026-02-28T20:00:00-05:30"}),
+            ("ended", {"valid_until": "2026-03-01T04:00:00+05:30"}),
+        )
+    ]
+    graph = (
+        _DispatchGraph(
+            [[row, i / 10] for i, row in enumerate(props)],
+            [[row["subject_key"], ["Entity"]] for row in props] + [["o", ["Entity"]]],
+        )
+        if vector
+        else _props_graph(*props)
+    )
+    store = FalkorDBClaimQueryStore(
+        settings=object(), graph=graph, embedder=_FakeEmbedder() if vector else None
+    )  # type: ignore[arg-type]
+    rows = store.find_claims(
+        ClaimQueryFilter(
+            pot_id="p1",
+            fact_query="match" if vector else None,
+            as_of=datetime(2026, 3, 1, tzinfo=timezone.utc),
+            valid_at_after=datetime(2026, 2, 28, 22, tzinfo=timezone.utc),
+            valid_at_before=datetime(2026, 2, 28, 23, 30, tzinfo=timezone.utc),
+            limit=1,
+        )
+    )
+    assert [row.subject_key for row in rows] == ["current"]
+
+
+def test_entity_labels_maps_keys() -> None:
+    graph = _FakeGraph(
+        header=[[1, "key"], [1, "labels"]],
+        result_set=[
+            ["service:web", ["Entity", "Service"]],
+            ["team:platform", ["Entity", "Team"]],
+        ],
+    )
+    store = FalkorDBClaimQueryStore(settings=object(), graph=graph)  # type: ignore[arg-type]
+    out = store.entity_labels(pot_id="p1", entity_keys=["service:web", "team:platform"])
+    assert out["service:web"] == ("Entity", "Service")
+    assert out["team:platform"] == ("Entity", "Team")
+
+
+def test_entity_labels_empty_keys_short_circuits() -> None:
+    graph = _FakeGraph(header=[], result_set=[])
+    store = FalkorDBClaimQueryStore(settings=object(), graph=graph)  # type: ignore[arg-type]
+    assert store.entity_labels(pot_id="p1", entity_keys=[]) == {}
+    assert graph.captured == []
+
+
+def test_entity_properties_returns_node_props() -> None:
+    graph = _FakeGraph(
+        header=[[1, "props"]],
+        result_set=[
+            [
+                {
+                    "entity_key": "service:web",
+                    "name": "web",
+                    "summary": "Web frontend service.",
+                    "description": "Web frontend service for browser clients.",
+                }
+            ]
+        ],
+    )
+    store = FalkorDBClaimQueryStore(settings=object(), graph=graph)  # type: ignore[arg-type]
+
+    props = store.entity_properties(pot_id="p1", entity_key="service:web")
+
+    assert props["summary"] == "Web frontend service."
+    assert props["description"] == "Web frontend service for browser clients."
+    cypher, params = graph.captured[0]
+    assert "RETURN properties(e) AS props" in cypher
+    assert params == {"gid": "p1", "key": "service:web"}

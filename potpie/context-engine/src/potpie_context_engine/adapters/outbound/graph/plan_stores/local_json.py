@@ -1,0 +1,212 @@
+"""Local JSON graph-plan store.
+
+This is the first local workbench implementation. It persists under the Potpie
+home so proposed plans survive separate CLI invocations; hosted installs can
+swap in a transactional store behind the same port.
+"""
+
+from __future__ import annotations
+
+from potpie_context_engine.core.mutation_execution import (
+    request_fingerprint as _request_fingerprint,
+)
+
+from io import StringIO
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from potpie_context_engine.core.graph_plans import GraphMutationPlanRecord
+from potpie_context_engine.adapters.outbound.graph._local_json_atomic import (
+    locked_json_store,
+    durable_json_replace,
+    strict_json_load,
+)
+from potpie_context_engine.adapters.outbound.local_paths import default_home
+
+from potpie_context_engine.core.mutation_execution import MutationPersistenceError
+
+
+@dataclass(slots=True)
+class LocalJsonGraphPlanStore:
+    home: Path = field(default_factory=default_home)
+    _observed_state: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def _path(self) -> Path:
+        return self.home / "graph_plans.json"
+
+    def save(self, record: GraphMutationPlanRecord) -> None:
+        with locked_json_store(self._path):
+            state = self._load()
+            plans = state.setdefault("plans", {})
+            by_pot = plans.setdefault(record.pot_id, {})
+            by_pot[record.plan_id] = record.to_dict()
+            self._save(state)
+
+    def reserve_idempotency(
+        self,
+        *,
+        record: GraphMutationPlanRecord,
+        idempotency_key: str,
+        request_fingerprint: str,
+    ) -> tuple[GraphMutationPlanRecord, bool]:
+        with locked_json_store(self._path):
+            state = self._load()
+            by_pot = state.setdefault("plans", {}).setdefault(record.pot_id, {})
+            for raw in by_pot.values():
+                existing = GraphMutationPlanRecord.from_dict(raw)
+                key = str(
+                    existing.original_payload.get("idempotency_key") or ""
+                ).strip()
+                if key != idempotency_key or not existing.reserves_idempotency:
+                    continue
+                same_request = (
+                    _request_fingerprint(existing.original_payload)
+                    == request_fingerprint
+                )
+                if not same_request:
+                    raise ValueError(
+                        f"idempotency_key {idempotency_key!r} is already bound to "
+                        f"plan {existing.plan_id!r} with different content"
+                    )
+                return existing, False
+            by_pot[record.plan_id] = record.to_dict()
+            self._save(state)
+            return record, True
+
+    def get(self, *, pot_id: str, plan_id: str) -> GraphMutationPlanRecord | None:
+        raw = self._load().get("plans", {}).get(pot_id, {}).get(plan_id)
+        if not isinstance(raw, dict):
+            return None
+        return GraphMutationPlanRecord.from_dict(raw)
+
+    def compare_and_set(
+        self,
+        *,
+        expected: GraphMutationPlanRecord,
+        replacement: GraphMutationPlanRecord,
+    ) -> bool:
+        key = (expected.pot_id, expected.plan_id)
+        if key != (replacement.pot_id, replacement.plan_id):
+            raise ValueError("plan compare-and-set cannot change plan identity")
+        with locked_json_store(self._path):
+            state = self._load()
+            by_pot = state.setdefault("plans", {}).setdefault(expected.pot_id, {})
+            raw = by_pot.get(expected.plan_id)
+            if not isinstance(raw, dict):
+                return False
+            if GraphMutationPlanRecord.from_dict(raw) != expected:
+                return False
+            by_pot[replacement.plan_id] = replacement.to_dict()
+            self._save(state)
+            return True
+
+    def list(
+        self,
+        *,
+        pot_id: str,
+        plan_id: str | None = None,
+        mutation_id: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[GraphMutationPlanRecord, ...]:
+        by_pot = self._load().get("plans", {}).get(pot_id, {})
+        if not isinstance(by_pot, dict):
+            return ()
+        records = [GraphMutationPlanRecord.from_dict(raw) for raw in by_pot.values()]
+        if plan_id:
+            records = [record for record in records if record.plan_id == plan_id]
+        if mutation_id:
+            records = [
+                record for record in records if record.mutation_id == mutation_id
+            ]
+        if since or until:
+            records = [
+                record
+                for record in records
+                if _record_in_window(record, since=since, until=until)
+            ]
+        records.sort(
+            key=lambda record: record.committed_at or record.created_at,
+            reverse=True,
+        )
+        if limit is not None and limit >= 0:
+            records = records[:limit]
+        return tuple(records)
+
+    def _load(self) -> dict[str, Any]:
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            if self._observed_state:
+                raise MutationPersistenceError(
+                    "previously observed plan store is missing"
+                )
+            return {"schema_version": 1, "plans": {}}
+        except (OSError, UnicodeError) as exc:
+            raise MutationPersistenceError(
+                f"graph plan store unreadable: {self._path}"
+            ) from exc
+        try:
+            data = strict_json_load(StringIO(raw))
+            if (
+                not isinstance(data, dict)
+                or type(data.get("schema_version")) is not int
+                or data.get("schema_version") != 1
+            ):
+                raise ValueError("unsupported graph plan store schema")
+            if not isinstance(data.get("plans"), dict):
+                raise ValueError("graph plan store requires a plans object")
+            for pot_id, plans in data["plans"].items():
+                if (
+                    not isinstance(pot_id, str)
+                    or not pot_id
+                    or not isinstance(plans, dict)
+                ):
+                    raise ValueError("invalid pot plan collection")
+                reservations = set()
+                for plan_id, payload in plans.items():
+                    record = GraphMutationPlanRecord.from_dict(payload)
+                    if (record.pot_id, record.plan_id) != (pot_id, plan_id):
+                        raise ValueError("plan storage identity mismatch")
+                    key = str(
+                        record.original_payload.get("idempotency_key") or ""
+                    ).strip()
+                    if key and record.reserves_idempotency:
+                        if key in reservations:
+                            raise ValueError("duplicate permanent request reservation")
+                        reservations.add(key)
+            self._observed_state = True
+            return data
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise MutationPersistenceError(
+                f"graph plan store is invalid: {self._path}: {exc}"
+            ) from exc
+
+    def _save(self, data: dict[str, Any]) -> None:
+        durable_json_replace(self._path, data)
+        self._observed_state = True
+
+
+def _record_in_window(
+    record: GraphMutationPlanRecord,
+    *,
+    since: datetime | None,
+    until: datetime | None,
+) -> bool:
+    times = (record.created_at, record.committed_at)
+    for value in times:
+        if value is None:
+            continue
+        if since is not None and value < since:
+            continue
+        if until is not None and value > until:
+            continue
+        return True
+    return False
+
+
+__all__ = ["LocalJsonGraphPlanStore"]
